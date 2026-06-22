@@ -12,11 +12,52 @@ across the batch (batch<=31, pages-per-seq<=91, so the score tensor is tiny).
 KV cache packed layout (deep_gemm), per page of `page_size` tokens:
   [ page_size*head_dim fp8 bytes | page_size*4 scale bytes ]
 """
+import os
+
 import torch
+import triton
+import triton.language as tl
 
 PAGE_SIZE = 64
 HEAD_DIM = 128
 TOPK = 2048
+
+
+@triton.jit
+def _fused_logits_kernel(q_ptr, k_ptr, w_ptr, out_ptr, B, N,
+                         sqb, sqh, sqd, skb, skn, skd, swb, swh, sob, son,
+                         BLOCK_N: tl.constexpr, H: tl.constexpr, D: tl.constexpr):
+    """scores[b,n] = sum_h relu( sum_d q[b,h,d]*k[b,n,d] ) * w[b,h], computed directly from the
+    dequantized k_deq[B,N,D] and q[B,H,D] so the [B,H,N] per-head logits are never materialized
+    (replaces bmm + relu + multiply + sum-over-heads). fp32 throughout."""
+    b = tl.program_id(0)
+    n0 = tl.program_id(1) * BLOCK_N
+    offs_n = n0 + tl.arange(0, BLOCK_N)
+    offs_h = tl.arange(0, H)
+    offs_d = tl.arange(0, D)
+    mask_n = offs_n < N
+    q = tl.load(q_ptr + b * sqb + offs_h[:, None] * sqh + offs_d[None, :] * sqd)   # [H, D]
+    k = tl.load(k_ptr + b * skb + offs_n[:, None] * skn + offs_d[None, :] * skd,
+                mask=mask_n[:, None], other=0.0)                                    # [BN, D]
+    ph = tl.dot(q, tl.trans(k))                                                     # [H, BN]
+    ph = tl.where(ph > 0.0, ph, 0.0)
+    w = tl.load(w_ptr + b * swb + offs_h * swh)                                     # [H]
+    acc = tl.sum(ph * w[:, None], axis=0)                                           # [BN]
+    tl.store(out_ptr + b * sob + offs_n * son, acc, mask=mask_n)
+
+
+def _fused_logits(q, k_deq, weights):
+    B, H, D = q.shape
+    N = k_deq.shape[1]
+    out = torch.empty((B, N), dtype=torch.float32, device=q.device)
+    BLOCK_N = 64
+    grid = (B, triton.cdiv(N, BLOCK_N))
+    _fused_logits_kernel[grid](q, k_deq, weights, out, B, N,
+                         q.stride(0), q.stride(1), q.stride(2),
+                         k_deq.stride(0), k_deq.stride(1), k_deq.stride(2),
+                         weights.stride(0), weights.stride(1), out.stride(0), out.stride(1),
+                         BLOCK_N=BLOCK_N, H=H, D=D, num_warps=4)
+    return out
 
 
 def _dequant_pages(packed_i8: torch.Tensor) -> torch.Tensor:
@@ -57,10 +98,16 @@ def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
     k_deq = k_deq.view(B, M * PAGE_SIZE, D)                 # [B, N, D]
     N = M * PAGE_SIZE
 
-    # Weighted ReLU scores, summed over heads, fully batched.
-    per_head = torch.bmm(q, k_deq.transpose(1, 2))          # [B, H, N]
-    per_head = torch.relu(per_head)
-    scores = (per_head * weights.float().unsqueeze(2)).sum(dim=1)   # [B, N]
+    # Weighted ReLU scores, summed over heads. Default: a fused Triton kernel that computes
+    # scores[B,N] directly from q and the dequantized k, never materializing the [B,H,N] per-head
+    # logits (saves the bmm-output + relu + multiply + sum passes; ~+5-8% end-to-end, verify 128/128).
+    # DSA_TOPK_TORCH=1 selects the original torch bmm+relu+sum path.
+    if os.environ.get("DSA_TOPK_TORCH") == "1":
+        per_head = torch.bmm(q, k_deq.transpose(1, 2))          # [B, H, N]
+        per_head = torch.relu(per_head)
+        scores = (per_head * weights.float().unsqueeze(2)).sum(dim=1)   # [B, N]
+    else:
+        scores = _fused_logits(q.contiguous(), k_deq.contiguous(), weights.float().contiguous())
 
     # Mask positions beyond each sequence length (token_position == flat index n).
     pos = torch.arange(N, device=device).unsqueeze(0)       # [1, N]

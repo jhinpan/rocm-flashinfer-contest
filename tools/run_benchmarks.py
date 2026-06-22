@@ -103,11 +103,22 @@ def collect_provenance(device):
         "aiter": _aiter_provenance(),
         "dataset": os.environ.get("FIB_DATASET_PATH", "n/a"),
         "fib_cache": os.environ.get("FIB_CACHE_PATH", "n/a"),
+        "sol_env": _sol_env(),
     }
 
 
+# Env vars that switch a solution's internal path — must be recorded so a result is reproducible.
+_SOL_ENV_VARS = ("MOE_USE_FUSED", "MOE_USE_DEQUANT", "DSA_USE_AITER", "DSA_TOPK_TORCH")
+
+
+def _sol_env():
+    on = {k: os.environ[k] for k in _SOL_ENV_VARS if os.environ.get(k)}
+    return ", ".join(f"{k}={v}" for k, v in on.items()) if on else "(defaults)"
+
+
 _PROV_FIELDS = ("timestamp_utc", "command", "commit", "branch", "describe", "baseline_commit",
-                "dirty", "gpu", "device", "torch", "hip", "triton", "aiter", "dataset", "fib_cache")
+                "dirty", "gpu", "device", "torch", "hip", "triton", "aiter", "dataset", "fib_cache",
+                "sol_env")
 
 
 def provenance_md(p):
