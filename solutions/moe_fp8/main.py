@@ -25,6 +25,17 @@ TOPK_GROUP = 4
 COMPUTE_DTYPE = torch.bfloat16
 
 
+def _dequant_block(w, scale):
+    """Block-scale dequant of a [R, C] fp8/int8 weight by a [R/128, C/128] fp32 scale, returning
+    bf16. Uses block-broadcast instead of `scale.repeat_interleave(128,0).repeat_interleave(128,1)`:
+    the expanded [R, C] scale is never materialized, removing the dominant per-expert elementwise /
+    memory-traffic cost found in profiling. Numerically identical (the same per-128x128-block scale
+    is applied to each element)."""
+    R, C = w.shape
+    wf = w.to(torch.float32).view(R // BLOCK, BLOCK, C // BLOCK, BLOCK)
+    return (wf * scale.to(torch.float32)[:, None, :, None]).view(R, C).to(COMPUTE_DTYPE)
+
+
 def run(
     routing_logits,
     routing_bias,
@@ -92,14 +103,9 @@ def run(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)                   # [Tk, H] bf16
 
-        # dequant this expert's weights to bf16
-        s13 = gemm1_weights_scale[le].to(torch.float32)      # [2I/128, H/128]
-        s13 = s13.repeat_interleave(BLOCK, 0).repeat_interleave(BLOCK, 1)   # [2I, H]
-        W13_e = (gemm1_weights[le].to(torch.float32) * s13).to(COMPUTE_DTYPE)  # [2I, H]
-
-        s2 = gemm2_weights_scale[le].to(torch.float32)       # [H/128, I/128]
-        s2 = s2.repeat_interleave(BLOCK, 0).repeat_interleave(BLOCK, 1)     # [H, I]
-        W2_e = (gemm2_weights[le].to(torch.float32) * s2).to(COMPUTE_DTYPE)   # [H, I]
+        # dequant this expert's weights to bf16 (block-broadcast; no repeat_interleave)
+        W13_e = _dequant_block(gemm1_weights[le], gemm1_weights_scale[le])   # [2I, H]
+        W2_e = _dequant_block(gemm2_weights[le], gemm2_weights_scale[le])    # [H, I]
 
         G1 = A_e.matmul(W13_e.t())                           # [Tk, 2I]
         X1 = G1[:, :I]

@@ -142,23 +142,47 @@ def load_run(path, modname="m"):
     return m.run
 
 
-def load_baseline_run(sdir, tmpdir):
-    """Load solutions/<sdir>/main.py as it exists at the peeled baseline commit (baseline-v1^{}),
-    so the candidate-vs-baseline comparison times the actual immutable baseline code, not the
-    current working tree. Returns None if the baseline file cannot be read."""
+def load_run_from_ref(sdir, ref, tmpdir, tag):
+    """Load solutions/<sdir>/main.py as it exists at a git ref (e.g. the peeled baseline commit),
+    so a comparison times that exact committed code, not the working tree. Returns None if the file
+    cannot be read at that ref."""
     try:
         src = subprocess.check_output(
-            ["git", "-C", str(ROOT), "show", f"{BASELINE_REF}:solutions/{sdir}/main.py"],
+            ["git", "-C", str(ROOT), "show", f"{ref}:solutions/{sdir}/main.py"],
             stderr=subprocess.DEVNULL).decode()
     except Exception:
         return None
-    p = Path(tmpdir) / f"baseline_{sdir}.py"
+    p = Path(tmpdir) / f"{tag}_{sdir}.py"
     p.write_text(src)
-    return load_run(p, modname=f"baseline_{sdir}")
+    return load_run(p, modname=f"{tag}_{sdir}")
+
+
+def load_baseline_run(sdir, tmpdir):
+    return load_run_from_ref(sdir, BASELINE_REF, tmpdir, "baseline")
 
 
 def as_list(r):
     return list(r) if isinstance(r, (tuple, list)) else [r]
+
+
+def clone_args(inp):
+    """Fresh copy of the argument list so candidate and baseline each time on pristine inputs
+    (cloned OUTSIDE the timed region — never inside time_runnable's loop)."""
+    return [x.clone() if torch.is_tensor(x) else x for x in inp]
+
+
+def mutates_inputs(fn, inp, dev):
+    """Read-only check: run fn once on a clone and report whether any input tensor changed.
+    A candidate that mutates inputs would invalidate paired timing / the reference comparison."""
+    snap = [x.clone() if torch.is_tensor(x) else None for x in inp]
+    args = clone_args(inp)
+    with torch.no_grad():
+        fn(*args)
+    torch.cuda.synchronize(dev)
+    for a, s in zip(args, snap):
+        if s is not None and (a.shape != s.shape or not torch.equal(a, s)):
+            return True
+    return False
 
 
 # Use the official evaluator's scoring helpers so correctness exactly matches verify.py.
@@ -211,6 +235,10 @@ def main():
                     help="repeat each candidate/baseline timing N times (paired, alternating order) "
                          "and report the median of medians plus min/max spread. Reduces small-kernel "
                          "timing noise so candidate-vs-baseline claims are trustworthy.")
+    ap.add_argument("--candidate-ref", default=None,
+                    help="load the candidate solution from this git ref instead of the working tree "
+                         "(e.g. --candidate-ref 'baseline-v1^{}' makes candidate==baseline for an "
+                         "unchanged-code self-check; ratios must come out ~1.00x).")
     args = ap.parse_args()
 
     ds = os.environ.get("FIB_DATASET_PATH")
@@ -232,7 +260,12 @@ def main():
         cfg = ResolvedEvalConfig(warmup_runs=5, iterations=iters, num_trials=1,
                                  rtol=rtol, atol=atol, required_matched_ratio=mr)
         ref_runnable = BuilderRegistry.get_instance().build_reference(definition)
-        run = load_run(ROOT / "solutions" / sdir / "main.py")
+        if args.candidate_ref:
+            run = load_run_from_ref(sdir, args.candidate_ref, tmpdir, "candidate")
+            if run is None:
+                print(f"  (warn: no candidate at {args.candidate_ref} for {sdir}; skipping)"); continue
+        else:
+            run = load_run(ROOT / "solutions" / sdir / "main.py")
         base_run = None if args.no_baseline_compare else load_baseline_run(sdir, tmpdir)
         if base_run is None and not args.no_baseline_compare:
             print(f"  (warn: no baseline-v1 solution for {sdir}; candidate-vs-baseline blank)")
@@ -258,20 +291,24 @@ def main():
                     mr_v = min(mr_v, m); ok = ok and (not ex)
 
             import statistics as _stats
-            # Repeated PAIRED timing on identical inputs, alternating candidate/baseline order each
-            # repeat to cancel ordering/thermal drift. Report median of per-repeat medians + spread.
+            # Read-only check: a candidate that mutates inputs would corrupt paired timing.
+            if mutates_inputs(run, inp, dev):
+                print(f"  WARNING: {sdir} candidate mutates its inputs — paired timing/ref compare "
+                      f"may be invalid; results suspect.")
+            # Repeated PAIRED timing, each call on a FRESH clone of the inputs (clone is outside the
+            # timed region). Alternate candidate/baseline order per repeat to cancel ordering drift.
             R = max(1, args.repeat_runs)
             sol_runs, base_runs = [], []
-            ref_ms = time_runnable(ref_runnable, inp, 5, iters, dev)
+            ref_ms = time_runnable(ref_runnable, clone_args(inp), 5, iters, dev)
             for rr in range(R):
                 if rr % 2 == 0:
-                    sol_runs.append(time_runnable(run, inp, 5, iters, dev))
+                    sol_runs.append(time_runnable(run, clone_args(inp), 5, iters, dev))
                     if base_run is not None:
-                        base_runs.append(time_runnable(base_run, inp, 5, iters, dev))
+                        base_runs.append(time_runnable(base_run, clone_args(inp), 5, iters, dev))
                 else:
                     if base_run is not None:
-                        base_runs.append(time_runnable(base_run, inp, 5, iters, dev))
-                    sol_runs.append(time_runnable(run, inp, 5, iters, dev))
+                        base_runs.append(time_runnable(base_run, clone_args(inp), 5, iters, dev))
+                    sol_runs.append(time_runnable(run, clone_args(inp), 5, iters, dev))
             sol_ms = _stats.median(sol_runs)
             base_ms = _stats.median(base_runs) if base_runs else None
             cvb = (base_ms / sol_ms) if base_ms else None            # candidate-vs-baseline (>1 = faster)
