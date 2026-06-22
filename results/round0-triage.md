@@ -58,6 +58,45 @@ shifts to eliminating that redundant layout rebuild; kernel-config tuning / spli
 secondary. This still serves AC-2 (speedup for dsa) and the Ultimate Goal. Logged in goal-tracker
 Plan Evolution.
 
+## Round 1 — full measured triage (all 5 kernels, clean profiler)
+
+Profiler driver fixed (inputs built once; no per-iter clone — the spurious `copyBuffer` dispatches
+that previously appeared in the dsa trace are gone, confirming they were clone artifacts). Harness
+now times `baseline-v1^{}` per workload (`results/v2_round0_baseline.md`, all ratios ≈1.00× since
+solutions are unchanged). rocprofv3 `--kernel-trace`, top dispatches by total time:
+
+| Kernel (bucket) | dominant dispatches | bottleneck class | lever |
+|---|---|---|---|
+| `dsa_sparse_attention` (min/max) | `CatArray` 65/63%, MLA kernel 28/30% | **host-side full-cache `torch.cat`** | remove O(num_pages) KV rebuild |
+| `moe_fp8` (seq55) | elementwise 44%+39% (**~16k small dispatches**), GEMM 3–6% | **elementwise / launch-bound** | fuse per-expert dequant/swiglu/scale/combine |
+| `moe_fp8` (seq14107) | elementwise 36%+32%, GEMM (Tensile) 18% | elementwise-bound, GEMM grows | fused experts; GEMM tuning secondary |
+| `dsa_topk_indexer` (min/max) | elementwise (dequant) 29–55%, topk gather+sort 14–15% @max, logits GEMM 6–9% | dequant-elementwise + topk/sort | fuse logits + segmented top-k |
+| `gdn_prefill` (max) | `_fused_recurrent_gated_delta_rule` **96%** | recurrent-kernel-bound | chunk path (parallel over chunks) |
+| `gdn_decode` (min/max) | elementwise (gate/transpose) 46/64%, recurrent kernel 25/22% | elementwise gate/transpose, tiny absolute (0.15–0.19ms) | fuse gate+drop transpose — low ROI |
+
+**Refinement to DEC-4 (fp8 MMA):** `moe_fp8` is launch/elementwise-bound; the GEMM is 3–18% of
+time, so native `fnuz` fp8 MMA would address a minority of the cost. The dominant win is **fusing
+the thousands of small per-expert elementwise launches** (dequant, SwiGLU, scaling, combine). fp8
+MMA stays a low-priority, profiling-gated experiment for the large-seq case only.
+
+**Measurement-noise note (DEC-1):** at the ~0.15–0.3ms scale (gdn_decode, dsa_topk), run-to-run
+variance was up to ~40% for *identical* code (e.g. baseline-vs-candidate of the unchanged
+gdn_decode B=16 showed 0.70×). The ≥20% IMPROVEMENT bar must therefore be confirmed as a stable
+median over the harness's fixed iters (and re-run) for these small kernels, not a single sample.
+
+**Revised ranking (Claude profile + Codex round-1 triage; Codex swapped 3↔4):**
+1. `dsa_sparse_attention` — high: remove host-side cat (~60% of per-call time).
+2. `moe_fp8` — medium: fuse per-expert elementwise launches (not fp8 MMA).
+3. `gdn_prefill` — low-medium: chunk path vs the 96%-dominant recurrent kernel.
+4. `dsa_topk_indexer` — medium-low: fuse logits + top-k.
+5. `gdn_decode` — low: tiny absolute; likely NO-GO unless the gate/transpose fuse is cheap.
+
+**DSA guardrail (Codex trap #3):** the legitimate fix removes the redundant work **within a single
+`run()` call** — gather only the referenced pages, or read `ckv`/`kpe` separately in a custom kernel
+so the full `[..,576]` cache is never materialized. Do **not** cache/prepack KV across calls or
+hoist work outside the measured path; `baseline/v1` rebuilds per call, so cross-call caching would
+change the measured work illegitimately (reward hacking).
+
 ## Correctness / generality guardrails (carry into every candidate)
 
 - Preserve exact paged-cache indexing, topk semantics, dtype/scaling, output tolerances (`verify.py`),
