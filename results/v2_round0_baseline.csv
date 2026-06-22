@@ -1,8 +1,8 @@
-# timestamp_utc=2026-06-22 19:58:41Z
-# command=python tools/run_benchmarks.py --out results/v2_round0_baseline
-# commit=7a177f90912781697745554a7e10231dba1d1761
+# timestamp_utc=2026-06-22 20:45:41Z
+# command=python tools/run_benchmarks.py --out results/v2_round0_baseline --repeat-runs 3 --candidate-ref baseline-v1^{}
+# commit=ab0d85d56e967f3c089e852c53b8e97ebf8bf684
 # branch=rlcr/optimize-5-kernels
-# describe=baseline-v1-3-g7a177f9
+# describe=baseline-v1-8-gab0d85d
 # baseline_commit=74c0918
 # dirty=no
 # gpu=AMD Instinct MI300X
@@ -10,22 +10,22 @@
 # torch=2.9.1+rocm7.2.0.git7e1940d4
 # hip=7.2.26015-fc0010cf6a
 # triton=3.6.0+git42270451
-# aiter=n/a (/sgl-workspace/aiter/aiter@7d604afe5)
+# aiter=editable-source (/sgl-workspace/aiter/aiter@7d604afe5)
 # dataset=/sgl-workspace/workspace/mlsys2026-flashinfer-contest/data/flashinfer-trace
 # fib_cache=/tmp/fib_cache
-kernel,axes,ref_ms,sol_ms,baseline_solution_ms,candidate_vs_baseline,latency_reduction_pct,speedup_vs_ref,correctness,matched_ratio
-gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 1}",1.8249,0.1467,0.1470,1.002,0.23,12.443,PASS,1.0000
-gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 16}",28.0765,0.3153,0.2218,0.703,-42.15,89.053,PASS,1.0000
-gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 64}",110.9312,0.1860,0.1817,0.977,-2.38,596.332,PASS,1.0000
-gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 6, 'num_seqs': 1, 'len_cu_seqlens': 2}",1.5692,0.1676,0.1664,0.993,-0.70,9.364,PASS,1.0000
-gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 139, 'num_seqs': 3, 'len_cu_seqlens': 4}",32.1223,0.1754,0.1748,0.996,-0.39,183.096,PASS,1.0000
-gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 8192, 'num_seqs': 39, 'len_cu_seqlens': 40}",1831.3281,3.4600,3.4766,1.005,0.48,529.287,PASS,1.0000
-dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 1, 'num_pages': 8462}",0.8031,0.8068,0.8078,1.001,0.12,0.995,PASS,1.0000
-dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 6, 'num_pages': 8462}",2.4349,0.8354,0.8342,0.999,-0.15,2.915,PASS,1.0000
-dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 8, 'num_pages': 8462}",3.0894,0.8309,0.8295,0.998,-0.17,3.718,PASS,1.0000
-dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 1, 'max_num_pages': 1, 'num_pages': 11923}",0.7371,0.3132,0.3135,1.001,0.10,2.353,PASS,1.0000
-dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 14, 'max_num_pages': 40, 'num_pages': 11923}",3.2407,0.3303,0.3305,1.001,0.07,9.812,PASS,1.0000
-dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 31, 'max_num_pages': 43, 'num_pages': 11923}",6.6714,0.3319,0.3297,0.994,-0.65,20.102,PASS,1.0000
-moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 1}",11.4091,2.9902,2.9769,0.996,-0.45,3.815,PASS,0.9902
-moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 55}",15.9607,12.8718,12.8870,1.001,0.12,1.240,PASS,0.9953
-moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 14107}",31.1612,22.3366,22.3242,0.999,-0.06,1.395,PASS,0.9942
+kernel,axes,ref_ms,sol_ms,sol_ms_min,sol_ms_max,baseline_solution_ms,baseline_ms_min,baseline_ms_max,candidate_vs_baseline,latency_reduction_pct,speedup_vs_ref,correctness,matched_ratio
+gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 1}",1.8493,0.1532,0.1525,0.1532,0.1538,0.1515,0.1543,1.004,0.40,12.070,PASS,1.0000
+gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 16}",28.2854,0.1478,0.1473,0.1480,0.1492,0.1485,0.1493,1.010,0.98,191.433,PASS,1.0000
+gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 64}",111.2635,0.1807,0.1794,0.1850,0.1802,0.1800,0.1803,0.998,-0.23,615.903,PASS,1.0000
+gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 6, 'num_seqs': 1, 'len_cu_seqlens': 2}",1.5918,0.1739,0.1735,0.1763,0.1730,0.1721,0.1730,0.995,-0.53,9.153,PASS,1.0000
+gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 139, 'num_seqs': 3, 'len_cu_seqlens': 4}",32.9048,0.1782,0.1779,0.1834,0.1785,0.1778,0.1803,1.001,0.14,184.604,PASS,1.0000
+gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 8192, 'num_seqs': 39, 'len_cu_seqlens': 40}",1860.1451,3.5597,3.5565,3.5605,3.5556,3.5549,3.5643,0.999,-0.12,522.557,PASS,1.0000
+dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 1, 'num_pages': 8462}",0.7968,0.8187,0.8186,0.8195,0.8187,0.8184,0.8205,1.000,0.00,0.973,PASS,1.0000
+dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 6, 'num_pages': 8462}",2.3910,0.8360,0.8359,0.8387,0.8362,0.8361,0.8368,1.000,0.02,2.860,PASS,1.0000
+dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 8, 'num_pages': 8462}",3.0016,0.8365,0.8353,0.8374,0.8367,0.8353,0.8370,1.000,0.02,3.588,PASS,1.0000
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 1, 'max_num_pages': 1, 'num_pages': 11923}",0.7455,0.3132,0.3117,0.3138,0.3116,0.3099,0.3123,0.995,-0.50,2.381,PASS,1.0000
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 14, 'max_num_pages': 40, 'num_pages': 11923}",3.1983,0.3266,0.3233,0.3277,0.3250,0.3246,0.3254,0.995,-0.49,9.792,PASS,1.0000
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 31, 'max_num_pages': 43, 'num_pages': 11923}",6.4157,0.3293,0.3285,0.3296,0.3289,0.3278,0.3292,0.999,-0.11,19.483,PASS,1.0000
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 1}",11.2536,2.8539,2.8417,2.9263,2.8514,2.8477,2.8561,0.999,-0.09,3.943,PASS,0.9900
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 55}",15.4572,12.6234,12.6195,12.6324,12.6375,12.6358,12.6414,1.001,0.11,1.224,PASS,0.9953
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 14107}",30.8515,22.2182,22.2064,22.2276,22.2223,22.2141,22.2411,1.000,0.02,1.389,PASS,0.9942

@@ -1,0 +1,31 @@
+# timestamp_utc=2026-06-22 20:46:51Z
+# command=python tools/run_benchmarks.py --out results/v2_round3 --repeat-runs 3
+# commit=ab0d85d56e967f3c089e852c53b8e97ebf8bf684
+# branch=rlcr/optimize-5-kernels
+# describe=baseline-v1-8-gab0d85d-dirty
+# baseline_commit=74c0918
+# dirty=yes
+# gpu=AMD Instinct MI300X
+# device=cuda:0
+# torch=2.9.1+rocm7.2.0.git7e1940d4
+# hip=7.2.26015-fc0010cf6a
+# triton=3.6.0+git42270451
+# aiter=editable-source (/sgl-workspace/aiter/aiter@7d604afe5)
+# dataset=/sgl-workspace/workspace/mlsys2026-flashinfer-contest/data/flashinfer-trace
+# fib_cache=/tmp/fib_cache
+kernel,axes,ref_ms,sol_ms,sol_ms_min,sol_ms_max,baseline_solution_ms,baseline_ms_min,baseline_ms_max,candidate_vs_baseline,latency_reduction_pct,speedup_vs_ref,correctness,matched_ratio
+gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 1}",1.8373,0.1468,0.1466,0.1468,0.1469,0.1469,0.1471,1.001,0.05,12.516,PASS,1.0000
+gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 16}",27.1718,0.1433,0.1432,0.1450,0.1433,0.1419,0.1440,1.000,-0.01,189.634,PASS,1.0000
+gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 64}",106.8298,0.1805,0.1798,0.1862,0.1808,0.1798,0.1810,1.002,0.20,591.953,PASS,1.0000
+gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 6, 'num_seqs': 1, 'len_cu_seqlens': 2}",1.5686,0.1674,0.1667,0.1683,0.1659,0.1655,0.1680,0.991,-0.94,9.369,PASS,1.0000
+gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 139, 'num_seqs': 3, 'len_cu_seqlens': 4}",32.0104,0.1734,0.1731,0.1736,0.1735,0.1734,0.1738,1.001,0.09,184.653,PASS,1.0000
+gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 8192, 'num_seqs': 39, 'len_cu_seqlens': 40}",1854.6237,3.5635,3.5591,3.5753,3.5635,3.5550,3.5674,1.000,-0.00,520.443,PASS,1.0000
+dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 1, 'num_pages': 8462}",0.7976,0.2326,0.2308,0.2339,0.8069,0.8060,0.8077,3.468,71.17,3.429,PASS,1.0000
+dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 6, 'num_pages': 8462}",2.4077,0.2445,0.2442,0.2450,0.8270,0.8270,0.8295,3.382,70.44,9.847,PASS,1.0000
+dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 8, 'num_pages': 8462}",3.0572,0.2458,0.2455,0.2464,0.8277,0.8262,0.8278,3.368,70.30,12.439,PASS,1.0000
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 1, 'max_num_pages': 1, 'num_pages': 11923}",0.7324,0.3070,0.3052,0.3079,0.3064,0.3049,0.3086,0.998,-0.20,2.386,PASS,1.0000
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 14, 'max_num_pages': 40, 'num_pages': 11923}",3.2165,0.3253,0.3234,0.3264,0.3259,0.3243,0.3282,1.002,0.19,9.889,PASS,1.0000
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 31, 'max_num_pages': 43, 'num_pages': 11923}",6.4939,0.3274,0.3264,0.3283,0.3302,0.3282,0.3314,1.009,0.86,19.837,PASS,1.0000
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 1}",11.3551,2.6025,2.5860,2.6166,2.8954,2.8674,2.9223,1.113,10.12,4.363,PASS,0.9884
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 55}",15.8950,10.5914,10.5883,10.6078,12.6950,12.6908,12.7114,1.199,16.57,1.501,PASS,0.9953
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 14107}",30.9668,19.1806,19.1643,19.1854,22.2626,22.2405,22.2750,1.161,13.84,1.614,PASS,0.9942
