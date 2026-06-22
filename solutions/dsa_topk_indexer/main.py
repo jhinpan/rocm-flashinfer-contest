@@ -103,6 +103,15 @@ def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):
     # computes scores[B,N] directly from q and dequantized k (no [B,H,N] tensor): ~+5-8% faster and
     # it passes the official verify.py (128/128), but its tie-break perturbs the per-run matched
     # ratio to ~0.988, a thinner correctness margin not worth a sub-20% gain — so it is off by default.
+    # Default: torch bmm + relu + weighted sum (matched-ratio 1.000 — most robust for the strict
+    # sorted-score evaluator). DSA_TOPK_FUSED=1 selects an experimental fused Triton kernel computing
+    # scores[B,N] directly (no [B,H,N]): ~+5-8% faster, verify.py 128/128, but thins the per-run
+    # matched ratio to ~0.988 — not worth a sub-20% gain, so off by default.
+    #
+    # The AITER deepgemm_fp8_paged_mqa_logits / aiter top-k levers were tested and rejected: AITER
+    # views the KV cache as e4m3fnuz (gfx942) while the contest data is e4m3fn (see
+    # tools/fp8_dtype_probe.py), and wiring them on the contest inputs hung the official verify.py
+    # (>700s) and triggered a GPU HSA exception. They are intentionally not wired here.
     if os.environ.get("DSA_TOPK_FUSED") == "1":
         scores = _fused_logits(q.contiguous(), k_deq.contiguous(), weights.float().contiguous())
     else:
