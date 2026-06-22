@@ -1,8 +1,15 @@
 # Round 0 — Measurement foundation + triage (RLCR optimize-5-kernels)
 
-**Date:** 2026-06-22 · **GPU:** AMD Instinct MI300X (gfx942) · **Commit:** d2f7a45 (working) ·
-**Baseline ref:** tag `baseline-v1` (15463ff) · **torch:** 2.9.1+rocm7.2 · **triton:** 3.6.0 ·
+**Date:** 2026-06-22 · **GPU:** AMD Instinct MI300X (gfx942) · **Profiling commit:** 7a177f9/2e83093
+(round-1 clean profiler) · **Peeled baseline:** `baseline-v1^{}` = 74c0918 · **torch:** 2.9.1+rocm7.2
+· **triton:** 3.6.0 · **aiter:** /sgl-workspace/aiter@7d604afe5 ·
+**dataset:** `mlsys2026-flashinfer-contest/data/flashinfer-trace` · **cache:** `/tmp/fib_cache` ·
 **Harness:** flashinfer-bench (HIP-event timing), `tools/run_benchmarks.py` (5 warmup + fixed iters).
+
+**Profiler command (per kernel/bucket):**
+`rocprofv3 --kernel-trace --output-format csv -d <dir> -o k -- python tools/profile_kernel.py
+--kernel <k> --bucket <min|med|max> --iters <N>`. Raw traces kept untracked under
+`/tmp/r1prof/<k>_<bucket>/` and `/tmp/round0_prof/` (summaries only committed, per DEC-3).
 
 Optimization bar (DEC-1): a headline IMPROVEMENT needs **≥20% median `solution_ms` reduction vs
 `baseline/v1`** (aim 20–30%+), correctness gate (`verify.py`) intact, no reward hacking (DEC-2).
@@ -73,6 +80,34 @@ solutions are unchanged). rocprofv3 `--kernel-trace`, top dispatches by total ti
 | `dsa_topk_indexer` (min/max) | elementwise (dequant) 29–55%, topk gather+sort 14–15% @max, logits GEMM 6–9% | dequant-elementwise + topk/sort | fuse logits + segmented top-k |
 | `gdn_prefill` (max) | `_fused_recurrent_gated_delta_rule` **96%** | recurrent-kernel-bound | chunk path (parallel over chunks) |
 | `gdn_decode` (min/max) | elementwise (gate/transpose) 46/64%, recurrent kernel 25/22% | elementwise gate/transpose, tiny absolute (0.15–0.19ms) | fuse gate+drop transpose — low ROI |
+
+**Per-dispatch metrics (top dispatches; launch count × avg µs = total µs, % of traced time):**
+
+| Kernel (bucket) | dispatch | launches | avg µs | total µs | % |
+|---|---|---:|---:|---:|---:|
+| dsa_sparse_attention (nt=1) | `CatArray` (torch.cat) | 110 | 237.5 | 26129 | 65.2 |
+| | `_kernel_unified_attention_sparse_mla_2d` | 55 | 206.0 | 11332 | 28.3 |
+| dsa_sparse_attention (nt=8) | `CatArray` | 110 | 237.6 | 26136 | 63.2 |
+| | MLA kernel | 55 | 224.3 | 12336 | 29.8 |
+| moe_fp8 (seq55) | `vectorized_elementwise` | 8933 | 20.0 | 178391 | 44.0 |
+| | `elementwise_manual_unroll` | 7140 | 22.5 | 160332 | 39.5 |
+| | Tensile GEMM (`Cijk_…MT1`) | 840 | 16.4 | 13767 | 3.4 |
+| moe_fp8 (seq14107) | `vectorized_elementwise` | 6028 | 25.1 | 151334 | 35.7 |
+| | `elementwise_manual_unroll` | 5880 | 23.3 | 137123 | 32.4 |
+| | Tensile GEMM | 1060 | 71.0 | 75239 | 17.8 |
+| dsa_topk_indexer (B=1) | `elementwise_manual_unroll` (dequant) | 495 | 2.9 | 1448 | 28.8 |
+| | `vectorized_elementwise` | 552 | 2.2 | 1201 | 23.9 |
+| dsa_topk_indexer (B=31) | `elementwise_manual_unroll` | 605 | 10.2 | 6193 | 37.5 |
+| | `sbtopk::gatherTopK` | 55 | 44.7 | 2460 | 14.9 |
+| | Tensile GEMM | 55 | 26.0 | 1431 | 8.7 |
+| gdn_prefill (seq8192) | `_fused_recurrent_gated_delta_rule` | 20 | 2886.4 | 57729 | 96.1 |
+| gdn_decode (B=1) | `vectorized_elementwise` | 440 | 2.1 | 901 | 46.1 |
+| | `_fused_recurrent_gated_delta_rule` | 55 | 8.8 | 486 | 24.9 |
+| gdn_decode (B=64) | `elementwise_manual_unroll` (gate/transpose) | 220 | 32.9 | 7246 | 64.4 |
+| | `_fused_recurrent_gated_delta_rule` | 55 | 45.8 | 2519 | 22.4 |
+
+(Launch counts include warmup=5+iters=50=55 calls; per-call counts = shown/55, e.g. moe_fp8 seq55 ≈
+292 elementwise launches per call.)
 
 **Refinement to DEC-4 (fp8 MMA):** `moe_fp8` is launch/elementwise-bound; the GEMM is 3–18% of
 time, so native `fnuz` fp8 MMA would address a minority of the cost. The dominant win is **fusing

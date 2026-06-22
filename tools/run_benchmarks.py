@@ -61,18 +61,26 @@ BASELINE_REF = "baseline-v1^{}"
 
 
 def _aiter_provenance():
+    """Resolve aiter version+source WITHOUT importing aiter (import has JIT side effects)."""
+    import importlib.util
+    from importlib.metadata import PackageNotFoundError, version
     try:
-        import aiter
-        src = Path(aiter.__file__).resolve().parent
-        commit = "n/a"
-        try:
-            commit = subprocess.check_output(["git", "-C", str(src), "rev-parse", "--short", "HEAD"],
-                                             stderr=subprocess.DEVNULL).decode().strip()
-        except Exception:
-            pass
-        return f"{_pkg_version('aiter')} ({src}@{commit})"
+        ver = version("aiter")
+    except PackageNotFoundError:
+        ver = "editable-source"
     except Exception:
-        return "n/a"
+        ver = "unknown"
+    src = "n/a"
+    commit = "n/a"
+    try:
+        spec = importlib.util.find_spec("aiter")
+        if spec and spec.origin:
+            src = str(Path(spec.origin).resolve().parent)
+            commit = subprocess.check_output(["git", "-C", src, "rev-parse", "--short", "HEAD"],
+                                             stderr=subprocess.DEVNULL).decode().strip() or "n/a"
+    except Exception:
+        pass
+    return f"{ver} ({src}@{commit})"
 
 
 def collect_provenance(device):
@@ -199,6 +207,10 @@ def main():
     ap.add_argument("--baseline", action="store_true", help="also benchmark NV flashinfer_wrapper baselines")
     ap.add_argument("--no-baseline-compare", action="store_true",
                     help="skip timing the baseline-v1 solution (candidate-vs-baseline columns blank)")
+    ap.add_argument("--repeat-runs", type=int, default=3,
+                    help="repeat each candidate/baseline timing N times (paired, alternating order) "
+                         "and report the median of medians plus min/max spread. Reduces small-kernel "
+                         "timing noise so candidate-vs-baseline claims are trustworthy.")
     args = ap.parse_args()
 
     ds = os.environ.get("FIB_DATASET_PATH")
@@ -245,19 +257,36 @@ def main():
                     _, _, ex, m = compute_error_stats(s, ref_out[i], cfg)
                     mr_v = min(mr_v, m); ok = ok and (not ex)
 
+            import statistics as _stats
+            # Repeated PAIRED timing on identical inputs, alternating candidate/baseline order each
+            # repeat to cancel ordering/thermal drift. Report median of per-repeat medians + spread.
+            R = max(1, args.repeat_runs)
+            sol_runs, base_runs = [], []
             ref_ms = time_runnable(ref_runnable, inp, 5, iters, dev)
-            sol_ms = time_runnable(run, inp, 5, iters, dev)
-            # Time the immutable baseline-v1 solution on the SAME inputs (AC-2).
-            base_ms = time_runnable(base_run, inp, 5, iters, dev) if base_run is not None else None
+            for rr in range(R):
+                if rr % 2 == 0:
+                    sol_runs.append(time_runnable(run, inp, 5, iters, dev))
+                    if base_run is not None:
+                        base_runs.append(time_runnable(base_run, inp, 5, iters, dev))
+                else:
+                    if base_run is not None:
+                        base_runs.append(time_runnable(base_run, inp, 5, iters, dev))
+                    sol_runs.append(time_runnable(run, inp, 5, iters, dev))
+            sol_ms = _stats.median(sol_runs)
+            base_ms = _stats.median(base_runs) if base_runs else None
             cvb = (base_ms / sol_ms) if base_ms else None            # candidate-vs-baseline (>1 = faster)
             red = (100.0 * (1 - sol_ms / base_ms)) if base_ms else None  # latency reduction %
-            rows.append(dict(kernel=defn, axes=dict(w.axes), ref_ms=ref_ms, sol_ms=sol_ms,
-                             base_ms=base_ms, cvb=cvb, red=red,
-                             speedup=ref_ms / sol_ms, ok=ok, mr=mr_v))
+            rows.append(dict(kernel=defn, sdir=sdir, axes=dict(w.axes), ref_ms=ref_ms, sol_ms=sol_ms,
+                             sol_min=min(sol_runs), sol_max=max(sol_runs),
+                             base_ms=base_ms,
+                             base_min=(min(base_runs) if base_runs else None),
+                             base_max=(max(base_runs) if base_runs else None),
+                             cvb=cvb, red=red, speedup=ref_ms / sol_ms, ok=ok, mr=mr_v))
             extra = (f" base={base_ms:8.3f} cvb={cvb:5.2f}x red={red:+5.1f}%"
                      if base_ms else " base=  n/a")
-            print(f"{sdir:22s} {str(dict(w.axes)):42s} ref={ref_ms:9.3f} sol={sol_ms:8.3f} "
-                  f"speedup={ref_ms/sol_ms:7.2f}x{extra} {'PASS' if ok else 'FAIL'}(mr={mr_v:.3f})")
+            print(f"{sdir:22s} {str(dict(w.axes)):42s} ref={ref_ms:9.3f} sol={sol_ms:8.3f}"
+                  f"[{min(sol_runs):.3f},{max(sol_runs):.3f}]{extra} "
+                  f"{'PASS' if ok else 'FAIL'}(mr={mr_v:.3f})")
 
     out = Path(ROOT / args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -269,11 +298,13 @@ def main():
         # full provenance as leading comment lines (one field per line for grep-ability)
         for k in _PROV_FIELDS:
             f.write(f"# {k}={prov[k]}\n")
-        f.write("kernel,axes,ref_ms,sol_ms,baseline_solution_ms,candidate_vs_baseline,"
-                "latency_reduction_pct,speedup_vs_ref,correctness,matched_ratio\n")
+        f.write("kernel,axes,ref_ms,sol_ms,sol_ms_min,sol_ms_max,baseline_solution_ms,"
+                "baseline_ms_min,baseline_ms_max,candidate_vs_baseline,latency_reduction_pct,"
+                "speedup_vs_ref,correctness,matched_ratio\n")
         for r in rows:
             f.write(f"{r['kernel']},\"{r['axes']}\",{r['ref_ms']:.4f},{r['sol_ms']:.4f},"
-                    f"{fmt(r['base_ms'])},{fmt(r['cvb'],3)},{fmt(r['red'],2)},"
+                    f"{fmt(r['sol_min'])},{fmt(r['sol_max'])},{fmt(r['base_ms'])},"
+                    f"{fmt(r['base_min'])},{fmt(r['base_max'])},{fmt(r['cvb'],3)},{fmt(r['red'],2)},"
                     f"{r['speedup']:.3f},{'PASS' if r['ok'] else 'FAIL'},{r['mr']:.4f}\n")
     md = out.with_suffix(".md")
     with open(md, "w") as f:
@@ -283,15 +314,17 @@ def main():
                 "`cand/base` = baseline-v1 solution latency / candidate latency (>1 = candidate "
                 "faster). `Δlat%` = latency reduction vs baseline-v1 (positive = faster).\n\n")
         f.write(provenance_md(prov))
-        f.write("| Kernel | Workload | reference ms | solution ms | baseline-v1 ms | cand/base | "
-                "Δlat% | speedup_vs_ref | correctness |\n")
+        f.write("| Kernel | Workload | reference ms | solution ms (min–max) | baseline-v1 ms | "
+                "cand/base | Δlat% | speedup_vs_ref | correctness |\n")
         f.write("|---|---|---:|---:|---:|---:|---:|---:|:--:|\n")
         for r in rows:
             cvb = f"{r['cvb']:.2f}×" if r['cvb'] is not None else "—"
             red = f"{r['red']:+.1f}%" if r['red'] is not None else "—"
-            base = f"{r['base_ms']:.3f}" if r['base_ms'] is not None else "—"
-            f.write(f"| `{r['kernel'].split('_')[0]}…` | {r['axes']} | {r['ref_ms']:.3f} | "
-                    f"{r['sol_ms']:.3f} | {base} | {cvb} | {red} | "
+            base = (f"{r['base_ms']:.3f} ({r['base_min']:.3f}–{r['base_max']:.3f})"
+                    if r['base_ms'] is not None else "—")
+            sol = f"{r['sol_ms']:.3f} ({r['sol_min']:.3f}–{r['sol_max']:.3f})"
+            f.write(f"| `{r['sdir']}` | {r['axes']} | {r['ref_ms']:.3f} | "
+                    f"{sol} | {base} | {cvb} | {red} | "
                     f"**{r['speedup']:.2f}×** | {'✅' if r['ok'] else '❌'} |\n")
     print(f"\nwrote {md} and {csv}")
 
