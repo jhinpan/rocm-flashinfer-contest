@@ -146,17 +146,14 @@ def run(
     nib = I // BLOCK                       # 16
     ngb = (2 * I) // BLOCK                 # 32
 
-    # Default path: block-broadcast dequant (_dequant_block) + rocBLAS bf16 matmul. This is the
-    # fastest *portable* path measured (~+10-17% vs baseline-v1).
+    # Default path: block-broadcast dequant (_dequant_block) + rocBLAS bf16 matmul — the fastest
+    # portable path measured here.
     #
     # MOE_USE_FUSED=1 selects an experimental Triton block-scale GEMM (_blockscale_gemm) that dequants
-    # fp8 weights in-tile so the full bf16 weight is never materialized. It is numerically correct
-    # (verify.py 19/19, fp32 accumulate) but measured SLOWER than the default everywhere
-    # (e.g. seq55 14.1ms vs 10.5ms; seq14107 41ms vs 19ms): a hand-written portable Triton GEMM
-    # cannot match rocBLAS/Tensile's tuned matmul for these shapes, so avoiding weight
-    # materialization does not pay off. Kept as documented evidence for the ≥20% NO-GO; see
-    # results/round4-report.md. (Native fp8 fnuz MMA is separately deprioritized per DEC-4: GEMM is
-    # only 3-18% of latency, and gfx942 native fp8 is e4m3fnuz vs the contest's e4m3fn.)
+    # fp8 weights in-tile so the full bf16 weight is never materialized. It is numerically equivalent
+    # (fp32 accumulate) but measured slower than the default for these shapes, because a hand-written
+    # Triton GEMM does not match the tuned rocBLAS/Tensile matmul the default uses; the saved weight
+    # traffic does not compensate. Off by default.
     use_fused = os.environ.get("MOE_USE_FUSED") == "1"
 
     # which local experts are actually selected

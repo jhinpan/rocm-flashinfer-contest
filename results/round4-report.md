@@ -3,7 +3,11 @@
 **GPU:** AMD Instinct MI300X (gfx942) · **Baseline:** `baseline-v1^{}` = 74c0918 ·
 **Harness:** `tools/run_benchmarks.py --repeat-runs 3` · **Gate:** official `verify.py`.
 
-## Verdict: `moe_fp8` → IMPROVEMENT (+10–17%, shipped) + NO-GO for ≥20% via the portable path
+## Verdict: `moe_fp8` → NO-GO for ≥20% (a marginal +10–17% block-broadcast fallback is shipped)
+
+The single task4 verdict is **NO-GO for the ≥20% target** via the portable path. A marginal,
+zero-risk speedup (block-broadcast dequant, +10–17%) is shipped as the default because it strictly
+beats baseline-v1 with no correctness/code risk, but it is **not** a headline IMPROVEMENT.
 
 **Shipped (default):** block-broadcast dequant (`_dequant_block`) + rocBLAS bf16 matmul.
 - `verify.py` **19/19 PASSED**; vs baseline-v1 **+9.8% / +17.2% / +13.9%** (seq 1 / 55 / 14107),
