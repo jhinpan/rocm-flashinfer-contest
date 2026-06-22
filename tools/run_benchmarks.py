@@ -20,7 +20,9 @@ import argparse
 import importlib.util
 import math
 import os
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -32,6 +34,55 @@ from flashinfer_bench.compile import BuilderRegistry
 from flashinfer_bench.data import TraceSet
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _pkg_version(name):
+    try:
+        return __import__(name).__version__
+    except Exception:
+        return "n/a"
+
+
+def _git(*args):
+    try:
+        return subprocess.check_output(["git", "-C", str(ROOT), *args],
+                                       stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return "n/a"
+
+
+def collect_provenance(device):
+    """Reproducibility metadata stamped into every results file so a candidate-vs-baseline
+    comparison is apples-to-apples (exact command, commit, baseline ref, GPU, library versions)."""
+    commit = _git("rev-parse", "HEAD")
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+        "command": "python " + " ".join(sys.argv),
+        "commit": commit,
+        "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+        "describe": _git("describe", "--tags", "--always", "--dirty"),
+        "baseline_tag": _git("rev-parse", "--short", "baseline-v1"),
+        "dirty": "yes" if _git("status", "--porcelain") else "no",
+        "gpu": torch.cuda.get_device_name(0),
+        "device": device,
+        "torch": torch.__version__,
+        "hip": getattr(torch.version, "hip", None) or "n/a",
+        "triton": _pkg_version("triton"),
+        "aiter": _pkg_version("aiter"),
+        "dataset": os.environ.get("FIB_DATASET_PATH", "n/a"),
+        "fib_cache": os.environ.get("FIB_CACHE_PATH", "n/a"),
+    }
+
+
+def provenance_md(p):
+    lines = ["## Provenance", "",
+             "Reproducibility metadata for this run (candidate-vs-`baseline/v1` comparisons are",
+             "only valid when these match).", "",
+             "| field | value |", "|---|---|"]
+    for k in ("timestamp_utc", "command", "commit", "branch", "describe", "baseline_tag",
+              "dirty", "gpu", "device", "torch", "hip", "triton", "aiter", "dataset", "fib_cache"):
+        lines.append(f"| {k} | `{p[k]}` |")
+    return "\n".join(lines) + "\n\n"
 
 # (definition, solution_dir, n_buckets, tol(atol,rtol,mr), n_outputs_to_compare or 'topk', iters)
 KERNELS = [
@@ -111,6 +162,8 @@ def main():
     ts = TraceSet.from_path(root)
     dev = args.device
     plat = torch.cuda.get_device_name(0)
+    prov = collect_provenance(dev)
+    print("provenance:", {k: prov[k] for k in ("commit", "branch", "baseline_tag", "gpu", "dirty")})
 
     rows = []
     for defn, sdir, axis, (atol, rtol, mr), ncmp, iters in KERNELS:
@@ -153,6 +206,9 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     csv = out.with_suffix(".csv")
     with open(csv, "w") as f:
+        f.write("# " + "; ".join(f"{k}={prov[k]}" for k in
+                ("timestamp_utc", "commit", "branch", "baseline_tag", "gpu", "torch", "triton",
+                 "aiter", "dirty")) + "\n")
         f.write("kernel,axes,ref_ms,sol_ms,speedup,correctness,matched_ratio\n")
         for r in rows:
             f.write(f"{r['kernel']},\"{r['axes']}\",{r['ref_ms']:.4f},{r['sol_ms']:.4f},"
@@ -161,6 +217,7 @@ def main():
     with open(md, "w") as f:
         f.write(f"# Benchmark results — {plat}\n\n")
         f.write("Speedup = torch-reference latency / solution latency (same reference on every platform).\n\n")
+        f.write(provenance_md(prov))
         f.write("| Kernel | Workload | reference ms | solution ms | speedup | correctness |\n")
         f.write("|---|---|---:|---:|---:|:--:|\n")
         for r in rows:
