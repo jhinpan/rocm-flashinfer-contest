@@ -1,0 +1,60 @@
+diff --git a/flashinfer_bench/bench/timing.py b/flashinfer_bench/bench/timing.py
+index 870c6a3..05e7fa9 100644
+--- a/flashinfer_bench/bench/timing.py
++++ b/flashinfer_bench/bench/timing.py
+@@ -10,7 +10,54 @@ from multiprocessing.synchronize import Lock as LockType
+ from typing import Any, List
+ 
+ import torch
+-from flashinfer.testing import bench_gpu_time_with_cupti
++
++try:
++    from flashinfer.testing import bench_gpu_time_with_cupti
++except Exception:  # pragma: no cover - ROCm / no-flashinfer fallback
++    # FIB-ROCm-PATCH: flashinfer (CUDA) may be unavailable (e.g. AMD ROCm box).
++    # Provide a torch.cuda.Event based fallback that matches the call signature
++    # used by time_runnable() below: fn, dry_run_iters, repeat_iters,
++    # input_args, cold_l2_cache, use_cuda_graph. torch.cuda.Event maps to HIP
++    # events on ROCm, so this gives real device-side timing.
++    def bench_gpu_time_with_cupti(
++        fn,
++        dry_run_iters: int = 25,
++        repeat_iters: int = 100,
++        input_args=None,
++        cold_l2_cache: bool = True,
++        use_cuda_graph: bool = False,
++        l2_flush_size_mb: int = 256,
++        l2_flush_device: str = "cuda",
++        **kwargs,
++    ):
++        args = tuple(input_args) if input_args is not None else ()
++        buffer = None
++        if cold_l2_cache:
++            buffer = torch.empty(
++                int(l2_flush_size_mb) * 1024 * 1024, device=l2_flush_device, dtype=torch.int8
++            )
++
++        # Warmup / dry runs
++        torch.cuda.synchronize()
++        for _ in range(max(1, int(dry_run_iters))):
++            if buffer is not None:
++                buffer.zero_()
++            fn(*args)
++        torch.cuda.synchronize()
++
++        n = max(1, int(repeat_iters))
++        start_events = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
++        end_events = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
++        torch.cuda.synchronize()
++        for i in range(n):
++            if buffer is not None:
++                buffer.zero_()
++            start_events[i].record()
++            fn(*args)
++            end_events[i].record()
++        torch.cuda.synchronize()
++        return [start_events[i].elapsed_time(end_events[i]) for i in range(n)]
++
+ 
+ from flashinfer_bench.compile import Runnable
+ 

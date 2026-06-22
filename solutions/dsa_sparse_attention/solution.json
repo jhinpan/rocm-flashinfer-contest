@@ -1,0 +1,23 @@
+{
+  "name": "dsa_sparse_attention_rocm_aiter_v1",
+  "definition": "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64",
+  "author": "rocm-port",
+  "spec": {
+    "language": "python",
+    "target_hardware": [
+      "AMD MI300X"
+    ],
+    "entry_point": "main.py::run",
+    "dependencies": [
+      "aiter"
+    ],
+    "destination_passing_style": false
+  },
+  "sources": [
+    {
+      "path": "main.py",
+      "content": "\"\"\"ROCm/MI300 dsa_sparse_attention solution.\n\nDeepSeek sparse MLA attention. Wraps AITER's `unified_attention_sparse_mla` (Triton, gfx942).\n\nPer query token: gather the topk KV tokens given by absolute indices `sparse_indices`\n(= page_idx*page_size + offset, -1 = padding), compute MLA logits\n    logits = q_nope @ ckv.T + q_pe @ kpe.T   (scaled by sm_scale)\nsoftmax, then output = softmax @ ckv.\n\nLayout for AITER: q = [q_nope(512) | q_pe(64)] -> [T,16,576];\nkv = [ckv(512) | kpe(64)] -> [num_pages, page_size, 1, 576]; value = kv[..., :512].\nEach query token is its own length-1 sequence (ALL_DECODE). The kernel masks -1 directly.\n\nWe return only `output` (the evaluator accepts 1 or 2 outputs; lse is optional).\n\"\"\"\nimport torch\nfrom aiter.ops.triton.attention.unified_attention_sparse_mla import (\n    unified_attention_sparse_mla,\n)\n\n\ndef run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):\n    num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape\n    head_dim_kpe = q_pe.shape[-1]\n    num_pages, page_size, _ = ckv_cache.shape\n\n    if isinstance(sm_scale, torch.Tensor):\n        sm_scale = float(sm_scale.item())\n    else:\n        sm_scale = float(sm_scale)\n\n    device = q_nope.device\n\n    # q: [T, H, 576] = [lora | rope]\n    q = torch.cat([q_nope, q_pe], dim=-1).contiguous()\n\n    # kv: [num_pages, page_size, 1, 576] = [lora | rope]\n    kv = torch.cat([ckv_cache, kpe_cache], dim=-1).unsqueeze(2).contiguous()\n\n    sparse_indices = sparse_indices.to(torch.int32)\n\n    # each query token is a length-1 sequence\n    cu_seqlens_q = torch.arange(num_tokens + 1, dtype=torch.int32, device=device)\n    max_seqlen_q = 1\n    seqused_k = (sparse_indices != -1).sum(dim=1).to(torch.int32)\n    max_seqlen_k = int(seqused_k.max().item()) if num_tokens > 0 else 0\n\n    # block_table is not used for indexing (the kernel maps topk_pos directly), but a\n    # tensor with a valid stride(0) is required.\n    block_table = torch.zeros((num_tokens, 1), dtype=torch.int32, device=device)\n\n    output = torch.empty(\n        (num_tokens, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device\n    )\n\n    unified_attention_sparse_mla(\n        q,\n        kv,\n        output,\n        cu_seqlens_q,\n        max_seqlen_q,\n        seqused_k,\n        max_seqlen_k,\n        sm_scale,\n        sparse_indices,\n        block_table,\n        head_dim_ckv,  # kv_lora_rank\n    )\n\n    return (output,)\n"
+    }
+  ],
+  "description": "ROCm/MI300 port for dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
+}

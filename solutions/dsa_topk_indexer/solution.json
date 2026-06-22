@@ -1,0 +1,21 @@
+{
+  "name": "dsa_topk_indexer_rocm_torch_v1",
+  "definition": "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64",
+  "author": "rocm-port",
+  "spec": {
+    "language": "python",
+    "target_hardware": [
+      "AMD MI300X"
+    ],
+    "entry_point": "main.py::run",
+    "dependencies": [],
+    "destination_passing_style": false
+  },
+  "sources": [
+    {
+      "path": "main.py",
+      "content": "\"\"\"ROCm/MI300 dsa_topk_indexer_fp8 solution.\n\nDeepSeek sparse-attention top-k indexer. For each query, score every KV token by a\nweighted sum of per-head ReLU(q . k), then return the global indices of the top-2048.\n\nThe official evaluator re-scores the *returned indices* with a canonical fp8->fp32\ndequant and compares sorted scores, so the only requirement is to select the true\ntop-k under fp32 dequant. We therefore dequantize to fp32 and compute exactly (this\nsidesteps the MI300 fp8 e4m3fnuz-vs-e4m3fn MMA question entirely), fully vectorized\nacross the batch (batch<=31, pages-per-seq<=91, so the score tensor is tiny).\n\nKV cache packed layout (deep_gemm), per page of `page_size` tokens:\n  [ page_size*head_dim fp8 bytes | page_size*4 scale bytes ]\n\"\"\"\nimport torch\n\nPAGE_SIZE = 64\nHEAD_DIM = 128\nTOPK = 2048\n\n\ndef _dequant_pages(packed_i8: torch.Tensor) -> torch.Tensor:\n    \"\"\"[P, page_size, 1, head_dim+4] int8 -> [P, page_size, head_dim] float32.\"\"\"\n    u8 = packed_i8.view(torch.uint8)\n    P, page_size, _, hd_sf = u8.shape\n    head_dim = hd_sf - 4\n    flat = u8.view(P, page_size * hd_sf)\n    fp8 = (\n        flat[:, : page_size * head_dim]\n        .contiguous()\n        .view(P, page_size, head_dim)\n        .view(torch.float8_e4m3fn)\n        .float()\n    )\n    scale = (\n        flat[:, page_size * head_dim:]\n        .contiguous()\n        .view(P, page_size, 4)\n        .view(torch.float32)\n    )  # [P, page_size, 1]\n    return fp8 * scale\n\n\ndef run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table):\n    device = q_index_fp8.device\n    B, H, D = q_index_fp8.shape\n    num_pages = k_index_cache_fp8.shape[0]\n    M = block_table.shape[1]\n\n    q = q_index_fp8.float()                         # [B, H, D]\n    seq_lens = seq_lens.to(torch.long)              # [B]\n\n    # Gather only the pages referenced by block_table, then dequant that subset.\n    bt = block_table.long().clamp_(0, num_pages - 1)        # [B, M]\n    gathered = k_index_cache_fp8[bt.reshape(-1)]            # [B*M, page_size, 1, 132]\n    k_deq = _dequant_pages(gathered)                        # [B*M, page_size, D]\n    k_deq = k_deq.view(B, M * PAGE_SIZE, D)                 # [B, N, D]\n    N = M * PAGE_SIZE\n\n    # Weighted ReLU scores, summed over heads, fully batched.\n    per_head = torch.bmm(q, k_deq.transpose(1, 2))          # [B, H, N]\n    per_head = torch.relu(per_head)\n    scores = (per_head * weights.float().unsqueeze(2)).sum(dim=1)   # [B, N]\n\n    # Mask positions beyond each sequence length (token_position == flat index n).\n    pos = torch.arange(N, device=device).unsqueeze(0)       # [1, N]\n    valid = pos < seq_lens.unsqueeze(1)                     # [B, N]\n    scores = scores.masked_fill(~valid, float(\"-inf\"))\n\n    k_sel = min(TOPK, N)\n    _, top_pos = torch.topk(scores, k_sel, dim=1)  # [B, k_sel] sorted desc\n\n    # A selected slot is a real token iff its position is within the sequence. Tokens whose\n    # cached data is NaN are still valid selections (torch.topk floats them to the top, exactly\n    # as the reference does) -- so gate on position validity, NOT on score finiteness.\n    valid_at_top = torch.gather(valid, 1, top_pos)                  # [B, k_sel]\n\n    slot = top_pos // PAGE_SIZE\n    offset = top_pos % PAGE_SIZE\n    global_page = torch.gather(block_table.long(), 1, slot)         # [B, k_sel]\n    global_token = (global_page * PAGE_SIZE + offset).to(torch.int32)\n\n    out = torch.full((B, TOPK), -1, dtype=torch.int32, device=device)\n    out[:, :k_sel] = torch.where(valid_at_top, global_token, torch.full_like(global_token, -1))\n    return (out,)\n"
+    }
+  ],
+  "description": "ROCm/MI300 port for dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+}

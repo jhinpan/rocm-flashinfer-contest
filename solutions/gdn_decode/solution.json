@@ -1,0 +1,23 @@
+{
+  "name": "gdn_decode_rocm_aiter_v1",
+  "definition": "gdn_decode_qk4_v8_d128_k_last",
+  "author": "rocm-port",
+  "spec": {
+    "language": "python",
+    "target_hardware": [
+      "AMD MI300X"
+    ],
+    "entry_point": "main.py::run",
+    "dependencies": [
+      "aiter"
+    ],
+    "destination_passing_style": false
+  },
+  "sources": [
+    {
+      "path": "main.py",
+      "content": "\"\"\"ROCm/MI300 gdn_decode solution.\n\nWraps AITER's `fused_recurrent_gated_delta_rule` (Triton, gfx942) to implement the\nsingle-token Gated Delta Net decode in k-last state layout.\n\nReference math (per head, fp32):\n    g    = exp(-exp(A_log) * softplus(a + dt_bias))     # multiplicative gate in (0,1)\n    beta = sigmoid(b)\n    delta-rule recurrent update; output = scale * q @ state_new\n\nAITER expects the decay `g` in LOG space (it applies exp(g) internally) and the\nrecurrent state as [N, HV, K, V], whereas the contest uses k-last [B, HV, V, K].\n\"\"\"\nimport math\n\nimport torch\nimport torch.nn.functional as F\nfrom aiter.ops.triton.gated_delta_net import fused_recurrent_gated_delta_rule\n\n\ndef run(q, k, v, state, A_log, a, dt_bias, b, scale):\n    # scale may arrive as python float or 0-d tensor\n    if isinstance(scale, torch.Tensor):\n        scale = float(scale.item())\n    else:\n        scale = float(scale)\n    if scale == 0.0:\n        scale = 1.0 / math.sqrt(q.shape[-1])\n\n    B = q.shape[0]\n    HV = v.shape[2]\n    K = q.shape[-1]\n    V = v.shape[-1]\n\n    # Gates in fp32. g is passed in LOG space: log(reference_g) = -exp(A_log)*softplus(a+dt_bias)\n    x = a.float() + dt_bias.float()                       # [B, 1, HV]\n    g_log = -torch.exp(A_log.float()) * F.softplus(x)     # [B, 1, HV]\n    beta = torch.sigmoid(b.float())                       # [B, 1, HV]\n\n    # k-last [B, HV, V, K] -> AITER [N=B, HV, K, V]\n    if state is not None:\n        init_state = state.transpose(-1, -2).contiguous().float()\n    else:\n        init_state = torch.zeros(B, HV, K, V, dtype=torch.float32, device=q.device)\n\n    o, final_state = fused_recurrent_gated_delta_rule(\n        q=q,\n        k=k,\n        v=v,\n        g=g_log,\n        beta=beta,\n        scale=scale,\n        initial_state=init_state,\n        output_final_state=True,\n        use_qk_l2norm_in_kernel=False,\n    )\n\n    # o: [B, 1, HV, V] bf16 (matches reference). new_state back to k-last [B, HV, V, K] fp32.\n    new_state = final_state.transpose(-1, -2).contiguous()\n    return o.to(torch.bfloat16), new_state\n"
+    }
+  ],
+  "description": "ROCm/MI300 port for gdn_decode_qk4_v8_d128_k_last"
+}
