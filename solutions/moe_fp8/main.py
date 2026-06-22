@@ -13,7 +13,11 @@ Routing (no-aux): sigmoid(logits); group 256 experts into 8 groups; per group su
 (with bias); keep top-4 groups; global top-8 by (s+bias); weights from unbiased s, normalized,
 scaled by routed_scaling_factor. SwiGLU gate = second half: C = silu(G1[:, I:]) * G1[:, :I].
 """
+import os
+
 import torch
+import triton
+import triton.language as tl
 
 H = 7168
 I = 2048
@@ -23,6 +27,57 @@ TOP_K = 8
 N_GROUP = 8
 TOPK_GROUP = 4
 COMPUTE_DTYPE = torch.bfloat16
+
+
+@triton.jit
+def _blockscale_gemm_kernel(
+    a_ptr,        # [M, K] bf16
+    w_ptr,        # [N, K] fp8 (e4m3fn)
+    s_ptr,        # [N/128, K/128] fp32 block scales
+    c_ptr,        # [M, N] bf16  (= a @ dequant(w).T)
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wn, stride_wk,
+    stride_sn, stride_sk,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """C = A @ dequant(W).T with per-128x128 block-scale dequant of W done IN-TILE (fp32 accumulate),
+    so the full dequantized bf16 weight is never materialized. BLOCK_N and BLOCK_K are 128 so each
+    [128,128] W tile maps to exactly one scale element. K and N are multiples of 128 (no K/N mask)."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    m_mask = offs_m < M
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    n_blk = pid_n  # BLOCK_N == 128
+    for k0 in range(0, K, BLOCK_K):
+        a = tl.load(a_ptr + offs_m[:, None] * stride_am + (k0 + offs_k)[None, :] * stride_ak,
+                    mask=m_mask[:, None], other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + offs_n[:, None] * stride_wn + (k0 + offs_k)[None, :] * stride_wk).to(tl.float32)
+        sc = tl.load(s_ptr + n_blk * stride_sn + (k0 // BLOCK_K) * stride_sk)
+        w = w * sc                                  # dequant this [128,128] block
+        acc += tl.dot(a, tl.trans(w))               # [BM,BK] @ [BK,BN]
+    tl.store(c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+             acc.to(tl.bfloat16), mask=m_mask[:, None])
+
+
+def _blockscale_gemm(a, w, scale):
+    """a:[M,K] bf16, w:[N,K] fp8, scale:[N/128,K/128] fp32 -> [M,N] bf16 = a @ dequant(w).T."""
+    M, K = a.shape
+    N = w.shape[0]
+    c = torch.empty((M, N), dtype=torch.bfloat16, device=a.device)
+    BLOCK_M = 32
+    grid = (triton.cdiv(M, BLOCK_M), N // 128)
+    _blockscale_gemm_kernel[grid](
+        a, w, scale, c, M, N, K,
+        a.stride(0), a.stride(1), w.stride(0), w.stride(1),
+        scale.stride(0), scale.stride(1), c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=128, BLOCK_K=128, num_warps=4, num_stages=1,
+    )
+    return c
 
 
 def _dequant_block(w, scale):
@@ -91,6 +146,19 @@ def run(
     nib = I // BLOCK                       # 16
     ngb = (2 * I) // BLOCK                 # 32
 
+    # Default path: block-broadcast dequant (_dequant_block) + rocBLAS bf16 matmul. This is the
+    # fastest *portable* path measured (~+10-17% vs baseline-v1).
+    #
+    # MOE_USE_FUSED=1 selects an experimental Triton block-scale GEMM (_blockscale_gemm) that dequants
+    # fp8 weights in-tile so the full bf16 weight is never materialized. It is numerically correct
+    # (verify.py 19/19, fp32 accumulate) but measured SLOWER than the default everywhere
+    # (e.g. seq55 14.1ms vs 10.5ms; seq14107 41ms vs 19ms): a hand-written portable Triton GEMM
+    # cannot match rocBLAS/Tensile's tuned matmul for these shapes, so avoiding weight
+    # materialization does not pay off. Kept as documented evidence for the ≥20% NO-GO; see
+    # results/round4-report.md. (Native fp8 fnuz MMA is separately deprioritized per DEC-4: GEMM is
+    # only 3-18% of latency, and gfx942 native fp8 is e4m3fnuz vs the contest's e4m3fn.)
+    use_fused = os.environ.get("MOE_USE_FUSED") == "1"
+
     # which local experts are actually selected
     sel_global = topk_idx                  # [T, 8]
     for le in range(E_local):
@@ -103,15 +171,19 @@ def run(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)                   # [Tk, H] bf16
 
-        # dequant this expert's weights to bf16 (block-broadcast; no repeat_interleave)
-        W13_e = _dequant_block(gemm1_weights[le], gemm1_weights_scale[le])   # [2I, H]
-        W2_e = _dequant_block(gemm2_weights[le], gemm2_weights_scale[le])    # [H, I]
-
-        G1 = A_e.matmul(W13_e.t())                           # [Tk, 2I]
+        if use_fused:
+            G1 = _blockscale_gemm(A_e, gemm1_weights[le], gemm1_weights_scale[le])  # [Tk, 2I]
+        else:
+            W13_e = _dequant_block(gemm1_weights[le], gemm1_weights_scale[le])      # [2I, H]
+            G1 = A_e.matmul(W13_e.t())
         X1 = G1[:, :I]
         X2 = G1[:, I:]
         C = (torch.nn.functional.silu(X2.float()) * X1.float()).to(COMPUTE_DTYPE)  # [Tk, I]
-        O = C.matmul(W2_e.t()).float()                       # [Tk, H]
+        if use_fused:
+            O = _blockscale_gemm(C, gemm2_weights[le], gemm2_weights_scale[le]).float()  # [Tk, H]
+        else:
+            W2_e = _dequant_block(gemm2_weights[le], gemm2_weights_scale[le])       # [H, I]
+            O = C.matmul(W2_e.t()).float()
 
         w_tok = weights.index_select(0, token_idx)[:, ge]    # [Tk]
         output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))

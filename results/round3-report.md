@@ -4,7 +4,12 @@
 **Harness:** `tools/run_benchmarks.py --repeat-runs 3` (mutation-safe paired timing) ·
 **Full table:** `results/v2_round3.md`.
 
-## Verdict: `moe_fp8` → IMPROVEMENT (partial: +10–17%, below the 20% headline bar)
+## `moe_fp8` → PARTIAL / MARGINAL result (+10–17%, NOT a final verdict)
+
+> This is a marginal result below the ≥20% headline bar, **not** a final AC-3 verdict. The final
+> `moe_fp8` verdict (IMPROVEMENT ≥20% / NO-GO / BLOCKED) is pending the fused block-scale MoE path
+> (round 4). The block-broadcast `_dequant_block()` change below is shipped as a safe, non-regressing
+> partial speedup and the correctness-safe fallback.
 
 | Workload | baseline-v1 ms | candidate ms (min–max) | cand/base | latency reduction | correctness |
 |---|---:|---:|---:|---:|:--:|
