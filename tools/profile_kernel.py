@@ -56,6 +56,10 @@ def main():
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--clone-each-iter", action="store_true",
+                    help="clone inputs every iteration (only for candidates that mutate inputs in "
+                         "place). UNSUITABLE for copy/launch-count evidence: it injects extra "
+                         "copy dispatches into the profile. Off by default.")
     args = ap.parse_args()
 
     ds = os.environ.get("FIB_DATASET_PATH")
@@ -70,14 +74,23 @@ def main():
     safe = (load_safetensors(definition, w, root)
             if any(d.type == "safetensors" for d in w.inputs.values()) else {})
     inp = gen_inputs(definition, w, device=args.device, safe_tensors=safe)
-    print(f"profiling {args.kernel} bucket={args.bucket} axes={dict(w.axes)} iters={args.iters}")
+    print(f"profiling {args.kernel} bucket={args.bucket} axes={dict(w.axes)} iters={args.iters} "
+          f"clone_each_iter={args.clone_each_iter}")
 
+    # Build the call args ONCE so the profiled loop contains only the solution's own dispatches —
+    # cloning per iteration would inject extra copy dispatches and corrupt copy/launch counts.
+    def call_args():
+        if args.clone_each_iter:
+            return [x.clone() if torch.is_tensor(x) else x for x in inp]
+        return inp
+
+    fixed = call_args()
     with torch.no_grad():
         for _ in range(args.warmup):
-            run(*[x.clone() if torch.is_tensor(x) else x for x in inp])
+            run(*(call_args() if args.clone_each_iter else fixed))
         torch.cuda.synchronize(args.device)
         for _ in range(args.iters):
-            run(*[x.clone() if torch.is_tensor(x) else x for x in inp])
+            run(*(call_args() if args.clone_each_iter else fixed))
         torch.cuda.synchronize(args.device)
     print("done")
 

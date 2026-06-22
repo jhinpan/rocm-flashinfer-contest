@@ -37,10 +37,15 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _pkg_version(name):
+    """Prefer installed package metadata (no import side effects); fall back to module __version__."""
     try:
-        return __import__(name).__version__
+        from importlib.metadata import version
+        return version(name)
     except Exception:
-        return "n/a"
+        try:
+            return __import__(name).__version__
+        except Exception:
+            return "n/a"
 
 
 def _git(*args):
@@ -51,27 +56,50 @@ def _git(*args):
         return "n/a"
 
 
+# git ref for the immutable comparison base, peeled to its commit (annotated tag -> commit).
+BASELINE_REF = "baseline-v1^{}"
+
+
+def _aiter_provenance():
+    try:
+        import aiter
+        src = Path(aiter.__file__).resolve().parent
+        commit = "n/a"
+        try:
+            commit = subprocess.check_output(["git", "-C", str(src), "rev-parse", "--short", "HEAD"],
+                                             stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            pass
+        return f"{_pkg_version('aiter')} ({src}@{commit})"
+    except Exception:
+        return "n/a"
+
+
 def collect_provenance(device):
     """Reproducibility metadata stamped into every results file so a candidate-vs-baseline
     comparison is apples-to-apples (exact command, commit, baseline ref, GPU, library versions)."""
-    commit = _git("rev-parse", "HEAD")
     return {
         "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
         "command": "python " + " ".join(sys.argv),
-        "commit": commit,
+        "commit": _git("rev-parse", "HEAD"),
         "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
         "describe": _git("describe", "--tags", "--always", "--dirty"),
-        "baseline_tag": _git("rev-parse", "--short", "baseline-v1"),
+        # peeled baseline commit (the actual code being compared against), not the tag object
+        "baseline_commit": _git("rev-parse", "--short", BASELINE_REF),
         "dirty": "yes" if _git("status", "--porcelain") else "no",
         "gpu": torch.cuda.get_device_name(0),
         "device": device,
         "torch": torch.__version__,
         "hip": getattr(torch.version, "hip", None) or "n/a",
         "triton": _pkg_version("triton"),
-        "aiter": _pkg_version("aiter"),
+        "aiter": _aiter_provenance(),
         "dataset": os.environ.get("FIB_DATASET_PATH", "n/a"),
         "fib_cache": os.environ.get("FIB_CACHE_PATH", "n/a"),
     }
+
+
+_PROV_FIELDS = ("timestamp_utc", "command", "commit", "branch", "describe", "baseline_commit",
+                "dirty", "gpu", "device", "torch", "hip", "triton", "aiter", "dataset", "fib_cache")
 
 
 def provenance_md(p):
@@ -79,8 +107,7 @@ def provenance_md(p):
              "Reproducibility metadata for this run (candidate-vs-`baseline/v1` comparisons are",
              "only valid when these match).", "",
              "| field | value |", "|---|---|"]
-    for k in ("timestamp_utc", "command", "commit", "branch", "describe", "baseline_tag",
-              "dirty", "gpu", "device", "torch", "hip", "triton", "aiter", "dataset", "fib_cache"):
+    for k in _PROV_FIELDS:
         lines.append(f"| {k} | `{p[k]}` |")
     return "\n".join(lines) + "\n\n"
 
@@ -99,11 +126,27 @@ KERNELS = [
 ]
 
 
-def load_run(path):
-    spec = importlib.util.spec_from_file_location("m", path)
+def load_run(path, modname="m"):
+    spec = importlib.util.spec_from_file_location(modname, path)
     m = importlib.util.module_from_spec(spec)
+    sys.modules[modname] = m
     spec.loader.exec_module(m)
     return m.run
+
+
+def load_baseline_run(sdir, tmpdir):
+    """Load solutions/<sdir>/main.py as it exists at the peeled baseline commit (baseline-v1^{}),
+    so the candidate-vs-baseline comparison times the actual immutable baseline code, not the
+    current working tree. Returns None if the baseline file cannot be read."""
+    try:
+        src = subprocess.check_output(
+            ["git", "-C", str(ROOT), "show", f"{BASELINE_REF}:solutions/{sdir}/main.py"],
+            stderr=subprocess.DEVNULL).decode()
+    except Exception:
+        return None
+    p = Path(tmpdir) / f"baseline_{sdir}.py"
+    p.write_text(src)
+    return load_run(p, modname=f"baseline_{sdir}")
 
 
 def as_list(r):
@@ -154,6 +197,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--baseline", action="store_true", help="also benchmark NV flashinfer_wrapper baselines")
+    ap.add_argument("--no-baseline-compare", action="store_true",
+                    help="skip timing the baseline-v1 solution (candidate-vs-baseline columns blank)")
     args = ap.parse_args()
 
     ds = os.environ.get("FIB_DATASET_PATH")
@@ -163,8 +208,10 @@ def main():
     dev = args.device
     plat = torch.cuda.get_device_name(0)
     prov = collect_provenance(dev)
-    print("provenance:", {k: prov[k] for k in ("commit", "branch", "baseline_tag", "gpu", "dirty")})
+    print("provenance:", {k: prov[k] for k in ("commit", "branch", "baseline_commit", "gpu", "dirty")})
 
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix="fib_baseline_")
     rows = []
     for defn, sdir, axis, (atol, rtol, mr), ncmp, iters in KERNELS:
         if defn not in ts.definitions:
@@ -174,6 +221,9 @@ def main():
                                  rtol=rtol, atol=atol, required_matched_ratio=mr)
         ref_runnable = BuilderRegistry.get_instance().build_reference(definition)
         run = load_run(ROOT / "solutions" / sdir / "main.py")
+        base_run = None if args.no_baseline_compare else load_baseline_run(sdir, tmpdir)
+        if base_run is None and not args.no_baseline_compare:
+            print(f"  (warn: no baseline-v1 solution for {sdir}; candidate-vs-baseline blank)")
         wls = [w.workload for w in ts.workloads[defn]]
         for w in pick_buckets(wls, axis, 3):
             safe = (load_safetensors(definition, w, root)
@@ -197,32 +247,52 @@ def main():
 
             ref_ms = time_runnable(ref_runnable, inp, 5, iters, dev)
             sol_ms = time_runnable(run, inp, 5, iters, dev)
+            # Time the immutable baseline-v1 solution on the SAME inputs (AC-2).
+            base_ms = time_runnable(base_run, inp, 5, iters, dev) if base_run is not None else None
+            cvb = (base_ms / sol_ms) if base_ms else None            # candidate-vs-baseline (>1 = faster)
+            red = (100.0 * (1 - sol_ms / base_ms)) if base_ms else None  # latency reduction %
             rows.append(dict(kernel=defn, axes=dict(w.axes), ref_ms=ref_ms, sol_ms=sol_ms,
+                             base_ms=base_ms, cvb=cvb, red=red,
                              speedup=ref_ms / sol_ms, ok=ok, mr=mr_v))
+            extra = (f" base={base_ms:8.3f} cvb={cvb:5.2f}x red={red:+5.1f}%"
+                     if base_ms else " base=  n/a")
             print(f"{sdir:22s} {str(dict(w.axes)):42s} ref={ref_ms:9.3f} sol={sol_ms:8.3f} "
-                  f"speedup={ref_ms/sol_ms:7.2f}x {'PASS' if ok else 'FAIL'}(mr={mr_v:.3f})")
+                  f"speedup={ref_ms/sol_ms:7.2f}x{extra} {'PASS' if ok else 'FAIL'}(mr={mr_v:.3f})")
 
     out = Path(ROOT / args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    def fmt(x, p=4):
+        return f"{x:.{p}f}" if x is not None else ""
+
     csv = out.with_suffix(".csv")
     with open(csv, "w") as f:
-        f.write("# " + "; ".join(f"{k}={prov[k]}" for k in
-                ("timestamp_utc", "commit", "branch", "baseline_tag", "gpu", "torch", "triton",
-                 "aiter", "dirty")) + "\n")
-        f.write("kernel,axes,ref_ms,sol_ms,speedup,correctness,matched_ratio\n")
+        # full provenance as leading comment lines (one field per line for grep-ability)
+        for k in _PROV_FIELDS:
+            f.write(f"# {k}={prov[k]}\n")
+        f.write("kernel,axes,ref_ms,sol_ms,baseline_solution_ms,candidate_vs_baseline,"
+                "latency_reduction_pct,speedup_vs_ref,correctness,matched_ratio\n")
         for r in rows:
             f.write(f"{r['kernel']},\"{r['axes']}\",{r['ref_ms']:.4f},{r['sol_ms']:.4f},"
+                    f"{fmt(r['base_ms'])},{fmt(r['cvb'],3)},{fmt(r['red'],2)},"
                     f"{r['speedup']:.3f},{'PASS' if r['ok'] else 'FAIL'},{r['mr']:.4f}\n")
     md = out.with_suffix(".md")
     with open(md, "w") as f:
         f.write(f"# Benchmark results — {plat}\n\n")
-        f.write("Speedup = torch-reference latency / solution latency (same reference on every platform).\n\n")
+        f.write("`speedup_vs_ref` = torch-reference latency / solution latency (same reference on "
+                "every platform).\n"
+                "`cand/base` = baseline-v1 solution latency / candidate latency (>1 = candidate "
+                "faster). `Δlat%` = latency reduction vs baseline-v1 (positive = faster).\n\n")
         f.write(provenance_md(prov))
-        f.write("| Kernel | Workload | reference ms | solution ms | speedup | correctness |\n")
-        f.write("|---|---|---:|---:|---:|:--:|\n")
+        f.write("| Kernel | Workload | reference ms | solution ms | baseline-v1 ms | cand/base | "
+                "Δlat% | speedup_vs_ref | correctness |\n")
+        f.write("|---|---|---:|---:|---:|---:|---:|---:|:--:|\n")
         for r in rows:
+            cvb = f"{r['cvb']:.2f}×" if r['cvb'] is not None else "—"
+            red = f"{r['red']:+.1f}%" if r['red'] is not None else "—"
+            base = f"{r['base_ms']:.3f}" if r['base_ms'] is not None else "—"
             f.write(f"| `{r['kernel'].split('_')[0]}…` | {r['axes']} | {r['ref_ms']:.3f} | "
-                    f"{r['sol_ms']:.3f} | **{r['speedup']:.2f}×** | {'✅' if r['ok'] else '❌'} |\n")
+                    f"{r['sol_ms']:.3f} | {base} | {cvb} | {red} | "
+                    f"**{r['speedup']:.2f}×** | {'✅' if r['ok'] else '❌'} |\n")
     print(f"\nwrote {md} and {csv}")
 
 
