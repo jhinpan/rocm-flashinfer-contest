@@ -110,7 +110,7 @@ def collect_provenance(device):
 
 
 # Env vars that switch a solution's internal path — must be recorded so a result is reproducible.
-_SOL_ENV_VARS = ("MOE_USE_FUSED", "MOE_USE_DEQUANT", "DSA_USE_AITER", "DSA_TOPK_TORCH",
+_SOL_ENV_VARS = ("MOE_USE_FUSED", "MOE_USE_DEQUANT", "DSA_USE_AITER", "DSA_TOPK_FAST",
                  "GDN_DECODE_FUSEDOP", "GDN_DECODE_RECURRENT", "GDN_DECODE_CONTIG_STATE",
                  "GDN_PREFILL_RECURRENT", "GDN_PREFILL_CHUNK_MIN")
 
@@ -258,6 +258,9 @@ def main():
                     help="load the candidate solution from this git ref instead of the working tree "
                          "(e.g. --candidate-ref 'baseline-v1^{}' makes candidate==baseline for an "
                          "unchanged-code self-check; ratios must come out ~1.00x).")
+    ap.add_argument("--only", default=None,
+                    help="comma-separated solution dir names to benchmark (e.g. --only dsa_topk_indexer); "
+                         "default runs all kernels.")
     args = ap.parse_args()
 
     if args.baseline_ref:
@@ -278,7 +281,10 @@ def main():
     import tempfile
     tmpdir = tempfile.mkdtemp(prefix="fib_baseline_")
     rows = []
+    only = set(args.only.split(",")) if args.only else None
     for defn, sdir, axis, (atol, rtol, mr), ncmp, iters in KERNELS:
+        if only is not None and sdir not in only:
+            continue
         if defn not in ts.definitions:
             print(f"skip {defn} (not in dataset)"); continue
         definition = ts.definitions[defn]
