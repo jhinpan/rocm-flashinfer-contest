@@ -49,6 +49,16 @@ tools/profile_kernel.py --kernel <k> --bucket <min|med|max> --iters <N>`. Raw tr
 | moe_fp8 (seq14107) | `elementwise_manual` (weight dequant) | 4600 | 33.3 | 41.8 | elementwise |
 | | Tensile GEMM | 1280 | 66.1 | 23.1 | GEMM |
 | | `vectorized_elementwise` | 4748 | 16.2 | 21.0 | elementwise |
+| moe_fp8 (seq1) | weight_dequant_elementwise | 1045 | 34.1 | 40.2 | elementwise |
+| | vectorized_elementwise | 3858 | 6.7 | 29.0 | elementwise |
+| | routing_reduce | 2530 | 3.2 | 9.1 | reduce |
+| | GEMM | 330 | 14.3 | 5.3 | GEMM |
+
+MoE seq1 (12,448 dispatches via `tools/summarize_rocprof_trace.py
+/tmp/v3prof/moe_fp8_min/k_kernel_trace.csv --kernel moe_fp8`): even at seq_len=1 the per-expert
+weight dequant (40%) + elementwise (29%) dominate (69%); GEMM only 5.3%. So the grouped/fused
+weight-materialization lever applies across all seq lengths (not just launch overhead at small seq).
+Stage tables are reproducible via the committed summarizer.
 
 ### Ceiling probes (byte-math)
 - **gdn_decode**: state `[B,HV,K,V]` fp32, B=64,HV=8,K=V=128 → 33.6 MB/transpose; 2 transposes ×
