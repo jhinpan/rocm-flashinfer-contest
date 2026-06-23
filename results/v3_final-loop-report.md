@@ -8,10 +8,11 @@ contest denominator `baseline/v1` (74c0918) and the pure-torch reference. GPU: A
 and the Kernel Design Agent.
 
 ## Correctness (full official gate, DEC-4) — all five kernels pass
-`results/v3_final_verify.md`: `moe_fp8` 19/19, `dsa_topk_indexer` 128/128, `dsa_sparse_attention`
-23/23 (full `verify.py`); `gdn_decode` 54/54 and `gdn_prefill` 100/100 (in-process full sweep at
-official atol=rtol=1e-2 + `verify.py --fast` 2/2; full subprocess `verify.py` is impractically slow
-for these two — identical comparison performed in-process). No regression on any kernel.
+`results/v3_final_verify.md`: the **full** official `verify.py` (no `--fast`) was run for **all five**
+kernels at finalize — `moe_fp8` 19/19, `dsa_topk_indexer` 128/128, `dsa_sparse_attention` 23/23,
+`gdn_decode` 54/54, `gdn_prefill` 100/100. The `gdn_prefill` full run took ~1h42m (100 workloads
+under per-workload subprocess isolation) but was run in full per DEC-4 rather than substituted with
+`--fast`. No regression on any kernel.
 
 ## Per-kernel verdicts
 
@@ -67,8 +68,10 @@ at mr ~0.99 (contest-correct, 128/128) — available behind the flag for speed o
 moe_fp8 seq1 (+2.5%) is marginal (near the noise bar), not a headline win.
 
 ## Loop accounting
-6 rounds (within `--max 12`). Round 3 gdn_decode; round 4 dsa_topk verdict + scaffold debt; round 5
-moe_fp8 + dsa_topk evidence; round 6 finalize. All DEC resolutions honored (DEC-1 >3–5% noise bar /
-moe ≥20% vs v1; DEC-2 dsa_topk mr≥0.999 hard gate → robustness default; DEC-3 no input-keyed caches;
-DEC-4 full official verify at finalize). No reward hacking: shape-family kernels only, full official
-sweeps checked, no per-workload constants or warmup caches.
+7 rounds (within `--max 12`). Round 3 gdn_decode; round 4 dsa_topk verdict + scaffold debt; round 5
+moe_fp8 + dsa_topk evidence; round 6 finalize (unified table + report); round 7 ran the **full**
+official `verify.py` (no `--fast`) for the two GDN kernels to honor DEC-4 exactly (the round-6
+`--fast` substitution was rejected). All DEC resolutions honored (DEC-1 >3–5% noise bar / moe ≥20%
+vs v1; DEC-2 dsa_topk mr≥0.999 hard gate → robustness default; DEC-3 no input-keyed caches; DEC-4
+full official verify at finalize for all five). No reward hacking: shape-family kernels only, full
+official sweeps checked, no per-workload constants or warmup caches.
