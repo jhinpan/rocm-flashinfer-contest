@@ -270,7 +270,9 @@ def main():
     dev = args.device
     plat = torch.cuda.get_device_name(0)
     prov = collect_provenance(dev)
-    print("provenance:", {k: prov[k] for k in ("commit", "branch", "baseline_commit", "gpu", "dirty")})
+    print("provenance:", {k: prov[k] for k in
+                          ("commit", "branch", "primary_baseline_ref", "primary_baseline_commit",
+                           "baseline_v1_commit", "gpu", "dirty")})
 
     import tempfile
     tmpdir = tempfile.mkdtemp(prefix="fib_baseline_")
