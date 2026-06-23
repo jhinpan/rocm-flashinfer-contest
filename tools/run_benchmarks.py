@@ -247,11 +247,19 @@ def main():
                     help="repeat each candidate/baseline timing N times (paired, alternating order) "
                          "and report the median of medians plus min/max spread. Reduces small-kernel "
                          "timing noise so candidate-vs-baseline claims are trustworthy.")
+    ap.add_argument("--baseline-ref", default=None,
+                    help="git ref of the locked comparison base to load baseline solutions from "
+                         "(default 'baseline-v1^{}'). Use 'baseline-v2^{}' to compare candidates "
+                         "against the shipped v2 state (the v3 no-regression base).")
     ap.add_argument("--candidate-ref", default=None,
                     help="load the candidate solution from this git ref instead of the working tree "
                          "(e.g. --candidate-ref 'baseline-v1^{}' makes candidate==baseline for an "
                          "unchanged-code self-check; ratios must come out ~1.00x).")
     args = ap.parse_args()
+
+    if args.baseline_ref:
+        global BASELINE_REF
+        BASELINE_REF = args.baseline_ref       # compare candidates against this locked base
 
     ds = os.environ.get("FIB_DATASET_PATH")
     assert ds, "set FIB_DATASET_PATH"
