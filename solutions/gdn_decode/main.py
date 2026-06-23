@@ -67,5 +67,12 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
     )
     # o is [NK=1, ...]; reshape to the reference's [B, 1, HV, V] (the fused op collapses the T dim).
     output = o.reshape(B, 1, HV, V).to(torch.bfloat16)
-    new_state = init_state.transpose(-1, -2).contiguous()    # [B, HV, V, K] fp32
+    # new_state in contest k-last [B, HV, V, K]: return the transposed VIEW of the (in-place updated)
+    # AITER state buffer instead of a `.contiguous()` copy. The fused op already updated init_state;
+    # the values are identical and a strided view is correct, so this removes one full state-sized
+    # copy (~half the host-side transpose traffic the profile flagged). Set GDN_DECODE_CONTIG_STATE=1
+    # to force a contiguous new_state.
+    new_state = init_state.transpose(-1, -2)                  # [B, HV, V, K] fp32 (view)
+    if os.environ.get("GDN_DECODE_CONTIG_STATE") == "1":
+        new_state = new_state.contiguous()
     return output, new_state
