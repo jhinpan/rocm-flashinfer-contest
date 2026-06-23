@@ -33,9 +33,12 @@ current (v3) state.
 0.988–0.992). A faster packed-page kernel (`DSA_TOPK_FAST=1`) is **+10–21%** vs baseline-v2 and passes
 the official 128/128, but lands at mr ~0.99, so it ships behind a flag rather than as the default.
 
-Full measured numbers: [`results/amd_mi300.md`](results/amd_mi300.md) (v3 candidate vs baseline-v2 and
-baseline/v1) · v3 verdicts per kernel: [`results/v3_final-loop-report.md`](results/v3_final-loop-report.md)
-· v2 report: [`results/final-loop-report.md`](results/final-loop-report.md).
+**📋 Full write-up — content, results, and RLCR findings:**
+[**`results/v3-summary.md`**](results/v3-summary.md). Raw numbers:
+[`results/amd_mi300.md`](results/amd_mi300.md) (v3 candidate vs baseline-v2 and baseline/v1) ·
+verdicts: [`results/v3_final-loop-report.md`](results/v3_final-loop-report.md) · full official
+correctness: [`results/v3_final_verify.md`](results/v3_final_verify.md) · v2 report:
+[`results/final-loop-report.md`](results/final-loop-report.md).
 
 ### Optimization methodology (RLCR)
 
@@ -53,6 +56,25 @@ and writes state in the contest layout directly (no host-side transposes, +64–
 block-scale dequant** for `moe_fp8` that feeds rocBLAS (+3–24%), and a robustness fix for
 `dsa_topk_indexer` (exact-`bmm` default restoring matched-ratio 1.0, with a faster packed-page kernel
 behind `DSA_TOPK_FAST=1`).
+
+**Reusable findings (full discussion in [`results/v3-summary.md`](results/v3-summary.md)):**
+- **Profile host overhead before tuning the kernel** — the biggest wins were deleting host-side waste
+  (a full-cache `torch.cat`, two state transposes, fp32 dequant temporaries), not micro-tuning.
+- **A portable hand-written GEMM does not beat rocBLAS/Tensile** — the winning shape is *fused dequant
+  feeding rocBLAS*, not *fused GEMM* (a fused-GEMM attempt was correct but slower; kept behind
+  `MOE_USE_FUSED=1` as evidence).
+- **For a layout-mismatched vendor kernel, re-implement the math in the target layout** rather than
+  transposing around it (removing both boundary copies beat shaving one → the `gdn_decode` win).
+- **Exact top-k gated on bit-level reference parity needs the same GEMM the reference uses** — `tl.dot`
+  can't bit-match `torch.bmm`, so "fast + matched-ratio≈1.0" can be mutually exclusive; the honest
+  result is an evidence-backed NO-GO plus a flagged speed option (`dsa_topk_indexer`).
+- **gfx942 native fp8 is `e4m3fnuz`, not the contest's `e4m3fn`** (≈2× decode error) — keep software
+  dequant; never bit-reinterpret to force a vendor fp8 path.
+- **An evidence-backed NO-GO is a first-class result** — it blocks reward-hacking (no per-workload
+  fitting, no warmup/input-keyed caches) and yields an honest, generalizing verdict.
+
+The loop converged in **7 rounds (budget 12)**, exited *complete*, and its code-review reviewer
+caught only substantive issues (≈zero false positives); see the methodology view in the summary.
 
 ## NVIDIA vs AMD
 
