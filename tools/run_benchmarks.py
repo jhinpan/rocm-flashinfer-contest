@@ -341,16 +341,24 @@ def main():
             base_ms = _stats.median(base_runs) if base_runs else None
             cvb = (base_ms / sol_ms) if base_ms else None            # candidate-vs-primary-base (>1 = faster)
             red = (100.0 * (1 - sol_ms / base_ms)) if base_ms else None  # latency reduction %
-            # baseline/v1 timing (contest denominator), if distinct from the primary base.
-            base_v1_ms = time_runnable(base_v1_run, clone_args(inp), 5, iters, dev) if base_v1_run else None
-            cvb_v1 = (base_v1_ms / sol_ms) if base_v1_ms else (cvb if BASELINE_REF == "baseline-v1^{}" else None)
-            red_v1 = (100.0 * (1 - sol_ms / base_v1_ms)) if base_v1_ms else (red if BASELINE_REF == "baseline-v1^{}" else None)
+            # baseline/v1 timing (contest denominator) with the same repeat/spread discipline.
+            if base_v1_run is not None:
+                v1_runs = [time_runnable(base_v1_run, clone_args(inp), 5, iters, dev) for _ in range(R)]
+                base_v1_ms = _stats.median(v1_runs); base_v1_min = min(v1_runs); base_v1_max = max(v1_runs)
+            elif BASELINE_REF == "baseline-v1^{}" and base_runs:
+                # primary base IS v1 — alias the primary timings into the v1 fields (no blank).
+                base_v1_ms, base_v1_min, base_v1_max = base_ms, min(base_runs), max(base_runs)
+            else:
+                base_v1_ms = base_v1_min = base_v1_max = None
+            cvb_v1 = (base_v1_ms / sol_ms) if base_v1_ms else None
+            red_v1 = (100.0 * (1 - sol_ms / base_v1_ms)) if base_v1_ms else None
             rows.append(dict(kernel=defn, sdir=sdir, axes=dict(w.axes), ref_ms=ref_ms, sol_ms=sol_ms,
                              sol_min=min(sol_runs), sol_max=max(sol_runs),
                              base_ms=base_ms,
                              base_min=(min(base_runs) if base_runs else None),
                              base_max=(max(base_runs) if base_runs else None),
-                             cvb=cvb, red=red, base_v1_ms=base_v1_ms, cvb_v1=cvb_v1, red_v1=red_v1,
+                             cvb=cvb, red=red, base_v1_ms=base_v1_ms, base_v1_min=base_v1_min,
+                             base_v1_max=base_v1_max, cvb_v1=cvb_v1, red_v1=red_v1,
                              speedup=ref_ms / sol_ms, ok=ok, mr=mr_v))
             v1x = (f" v1={base_v1_ms:8.3f} cvb_v1={cvb_v1:5.2f}x" if base_v1_ms else "")
             extra = (f" base={base_ms:8.3f} cvb={cvb:5.2f}x red={red:+5.1f}%{v1x}"
@@ -364,23 +372,26 @@ def main():
     def fmt(x, p=4):
         return f"{x:.{p}f}" if x is not None else ""
 
-    # Primary base label, e.g. "baseline-v2" from ref "baseline-v2^{}".
+    # Primary base: pretty markdown label ("baseline-v2") and a stable CSV identifier ("baseline_v2").
     pbase = BASELINE_REF.replace("^{}", "")
+    pbase_csv = pbase.replace("-", "_").replace("/", "_")
     csv = out.with_suffix(".csv")
     with open(csv, "w") as f:
         # full provenance as leading comment lines (one field per line for grep-ability)
         for k in _PROV_FIELDS:
             f.write(f"# {k}={prov[k]}\n")
         f.write(f"kernel,axes,ref_ms,sol_ms,sol_ms_min,sol_ms_max,"
-                f"{pbase}_ms,{pbase}_ms_min,{pbase}_ms_max,candidate_vs_{pbase},"
-                f"latency_reduction_vs_{pbase}_pct,"
-                f"baseline_v1_ms,candidate_vs_baseline_v1,latency_reduction_vs_baseline_v1_pct,"
+                f"{pbase_csv}_ms,{pbase_csv}_ms_min,{pbase_csv}_ms_max,candidate_vs_{pbase_csv},"
+                f"latency_reduction_vs_{pbase_csv}_pct,"
+                f"baseline_v1_ms,baseline_v1_ms_min,baseline_v1_ms_max,candidate_vs_baseline_v1,"
+                f"latency_reduction_vs_baseline_v1_pct,"
                 f"speedup_vs_ref,correctness,matched_ratio\n")
         for r in rows:
             f.write(f"{r['kernel']},\"{r['axes']}\",{r['ref_ms']:.4f},{r['sol_ms']:.4f},"
                     f"{fmt(r['sol_min'])},{fmt(r['sol_max'])},{fmt(r['base_ms'])},"
                     f"{fmt(r['base_min'])},{fmt(r['base_max'])},{fmt(r['cvb'],3)},{fmt(r['red'],2)},"
-                    f"{fmt(r['base_v1_ms'])},{fmt(r['cvb_v1'],3)},{fmt(r['red_v1'],2)},"
+                    f"{fmt(r['base_v1_ms'])},{fmt(r['base_v1_min'])},{fmt(r['base_v1_max'])},"
+                    f"{fmt(r['cvb_v1'],3)},{fmt(r['red_v1'],2)},"
                     f"{r['speedup']:.3f},{'PASS' if r['ok'] else 'FAIL'},{r['mr']:.4f}\n")
     md = out.with_suffix(".md")
     with open(md, "w") as f:
