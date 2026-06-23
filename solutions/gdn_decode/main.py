@@ -2,18 +2,25 @@
 
 Single-token Gated Delta Net decode in k-last state layout.
 
-Default path uses AITER's `fused_sigmoid_gating_delta_rule_update`, which computes the sigmoid/
-softplus gate AND the recurrent delta-rule update in ONE fused kernel — removing the host-side
-gate elementwise ops (exp / softplus / sigmoid) that the previous wrapper launched separately and
-that dominated at larger batch. Numerically identical to the recurrent path (max diff 0.0) and
-~+23-28% faster. `GDN_DECODE_RECURRENT=1` selects the original
-`fused_recurrent_gated_delta_rule` wrapper (host-side gate compute) as a fallback.
+Default path is a repo-local Triton kernel (`_run_klast`) that reads the initial state AND writes
+the final state in the contest k-last layout [B, HV, V, K] **directly**, with the gate (softplus/
+sigmoid), the recurrent delta-rule update, and the output projection fused into ONE dispatch. This
+removes BOTH host-side state transpose copies that the AITER-based path needed (the profile showed
+those copies at 62-81% of latency). The gate math is copied verbatim from AITER's
+`fused_sigmoid_gating_delta_rule_update_kernel`; only the state offsets differ (k stride 1,
+v stride K) and the final state is written to a separate buffer (no input mutation). ~+65-78% vs
+baseline-v2; verify 54/54.
+
+Fallbacks (for debugging / evidence only):
+  - `GDN_DECODE_FUSEDOP=1`: AITER `fused_sigmoid_gating_delta_rule_update` + a transposed-view
+    output state (one transpose copy on the way in). `GDN_DECODE_CONTIG_STATE=1` forces a
+    contiguous new_state within this path.
+  - `GDN_DECODE_RECURRENT=1`: host-side gate compute + `fused_recurrent_gated_delta_rule`.
 
 Reference math (per head, fp32):
     g    = exp(-exp(A_log) * softplus(a + dt_bias))     # multiplicative gate in (0,1)
     beta = sigmoid(b)
-The fused op takes raw A_log/a/dt_bias/b + softplus params and reproduces this internally.
-State is k-last [B, HV, V, K]; AITER uses [N, HV, K, V] (transposed at the boundary).
+State is k-last [B, HV, V, K]; the AITER fallbacks use [N, HV, K, V] (transposed at the boundary).
 """
 import math
 import os

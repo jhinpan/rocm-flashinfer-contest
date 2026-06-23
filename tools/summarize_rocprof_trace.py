@@ -2,10 +2,12 @@
 """Summarize a rocprofv3 kernel-trace CSV into a per-stage table.
 
 Reads a `*_kernel_trace.csv` produced by `rocprofv3 --kernel-trace --output-format csv` and emits
-`stage,kernel_pattern,launches,total_us,avg_us,pct,class` so the triage stage tables are reproducible
-from the raw traces (not hand-edited).
+`bucket,stage,kernel_pattern,launches,total_us,avg_us,pct,class` so the triage stage tables are
+reproducible from the raw traces (not hand-edited). `bucket` is the `--bucket` label (min/med/max);
+it defaults to `?` when not supplied.
 
-    python tools/summarize_rocprof_trace.py /tmp/v3prof/moe_fp8_min/k_kernel_trace.csv --kernel moe_fp8
+    python tools/summarize_rocprof_trace.py /tmp/v3prof/moe_fp8_min/k_kernel_trace.csv \
+        --kernel moe_fp8 --bucket min
 
 Stage attribution is by kernel-name substring; unmatched dispatches fall into "other".
 """
