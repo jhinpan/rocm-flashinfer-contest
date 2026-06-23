@@ -16,17 +16,31 @@ so they build with the portable PythonBuilder — no `nvcc`, no CUDA dependencie
 ## TL;DR results (AMD MI300X)
 
 All five kernels pass the official `verify.py` scorer on ROCm. Speedup is measured against the
-**identical pure-torch reference** in each definition (`speedup = reference_ms / solution_ms`).
+**identical pure-torch reference** in each definition (`speedup = reference_ms / solution_ms`). The
+**v2 (RLCR)** column is the latency reduction of the optimized solution vs the locked `baseline/v1`.
 
-| # | Kernel | Correctness (official `verify.py`) | AMD speedup vs torch reference |
-|---|--------|:--:|--|
-| 1 | `gdn_decode` | ✅ 54/54 | **12× – 578×** (grows with batch) |
-| 2 | `gdn_prefill` | ✅ 100/100 | **9× – 537×** (grows with seq len) |
-| 3 | `dsa_sparse_attention` | ✅ 23/23 | 1.0× – 3.7× |
-| 4 | `dsa_topk_indexer_fp8` | ✅ 128/128 | 2.4× – 20× |
-| 5 | `moe_fp8_block_scale` | ✅ 19/19 (loose tol) | 1.2× – 3.8× |
+| # | Kernel | Correctness (official `verify.py`) | AMD speedup vs torch reference | v2 vs `baseline/v1` |
+|---|--------|:--:|--|--|
+| 1 | `gdn_decode` | ✅ 54/54 | **17× – 780×** (grows with batch) | **+23–27%** |
+| 2 | `gdn_prefill` | ✅ 100/100 | **9× – ~3500×** (grows with seq len) | **+84.8%** (long seq) |
+| 3 | `dsa_sparse_attention` | ✅ 23/23 | 3.4× – 12.3× | **+70%** |
+| 4 | `dsa_topk_indexer_fp8` | ✅ 128/128 | 2.4× – 20× | (robust path; fused +5–8% available) |
+| 5 | `moe_fp8_block_scale` | ✅ 19/19 (loose tol) | 1.5× – 4.3× | **+9–17%** |
 
-Full measured numbers: [`results/amd_mi300.md`](results/amd_mi300.md).
+Full measured numbers: [`results/amd_mi300.md`](results/amd_mi300.md) (v2 candidate-vs-baseline) ·
+verdicts per kernel: [`results/final-loop-report.md`](results/final-loop-report.md).
+
+### v2 optimization methodology
+
+The v2 kernels were produced by an autonomous **RLCR** (Reinforcement-Learning-from-Code-Review)
+optimization loop run with the [`rocm-KDA-pilot`](https://github.com/jhinpan/rocm-KDA-pilot) skill —
+a ROCm/MI300 kernel-optimization harness **inspired by [Humanize](https://github.com/PolyArch) and
+the Kernel Design Agent (KDA)**. Each candidate is gated on the official `verify.py` correctness
+counts (never weakened), benchmarked against the immutable `baseline/v1` with HIP-event timing and
+full provenance, and accepted only with evidence (a ≥20% latency reduction) or closed with an
+evidence-backed NO-GO. Wins came from removing host-side waste (a per-call full-cache `torch.cat` in
+`dsa_sparse_attention`, `repeat_interleave` weight dequant in `moe_fp8`, host-side gate compute in
+`gdn_decode`) and a genuine algorithmic lever (chunk-parallel prefill in `gdn_prefill`).
 
 ## NVIDIA vs AMD
 
