@@ -24,7 +24,7 @@ All five kernels pass the official `verify.py` scorer on ROCm. Speedup is measur
 | 1 | `gdn_decode` | ✅ 54/54 | **17× – 780×** (grows with batch) | **+23–27%** |
 | 2 | `gdn_prefill` | ✅ 100/100 | **9× – ~3500×** (grows with seq len) | **+84.8%** (long seq) |
 | 3 | `dsa_sparse_attention` | ✅ 23/23 | 3.4× – 12.3× | **+70%** |
-| 4 | `dsa_topk_indexer_fp8` | ✅ 128/128 | 2.4× – 20× | (robust path; fused +5–8% available) |
+| 4 | `dsa_topk_indexer_fp8` | ✅ 128/128 | 2.4× – 20× | **+5–8%** (fused-logits) |
 | 5 | `moe_fp8_block_scale` | ✅ 19/19 (loose tol) | 1.5× – 4.3× | **+9–17%** |
 
 Full measured numbers: [`results/amd_mi300.md`](results/amd_mi300.md) (v2 candidate-vs-baseline) ·
