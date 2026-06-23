@@ -58,7 +58,6 @@ def ref_route(logits, bias, scale, E=256, ngroup=8, topk_group=4, top_k=8):
 
 
 def ref_dequant_hidden(hidden, hscale, H=7168, blk=128):
-    T = hidden.shape[0]
     sc = hscale.float().t().contiguous()                                    # [T, H/128]
     sc_full = sc.repeat_interleave(blk, dim=1)                              # [T, H]
     return (hidden.float() * sc_full).to(torch.bfloat16)
