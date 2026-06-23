@@ -126,35 +126,22 @@ def _dequant(w, scale):
     return _dequant_triton(w, scale)
 
 
-def run(
-    routing_logits,
-    routing_bias,
-    hidden_states,
-    hidden_states_scale,
-    gemm1_weights,
-    gemm1_weights_scale,
-    gemm2_weights,
-    gemm2_weights_scale,
-    local_expert_offset,
-    routed_scaling_factor,
-):
-    device = hidden_states.device
-    T = routing_logits.shape[0]
-    E_local = gemm1_weights.shape[0]
-    nhb = H // BLOCK  # 56
-    if isinstance(local_expert_offset, torch.Tensor):
-        local_start = int(local_expert_offset.item())
-    else:
-        local_start = int(local_expert_offset)
-    if isinstance(routed_scaling_factor, torch.Tensor):
-        routed_scaling_factor = float(routed_scaling_factor.item())
-
-    # ---- 1) dequant hidden states -> bf16 [T, H] ----
+def _dequant_hidden(hidden_states, hidden_states_scale):
+    """Dequant the per-128-channel-block fp8 hidden states to bf16 [T, H].
+    hidden_states_scale is stored [H/128, T]; transpose to [T, H/128] and broadcast over the block."""
+    T = hidden_states.shape[0]
+    nhb = H // BLOCK
     A_scale = hidden_states_scale.to(torch.float32).permute(1, 0).contiguous()  # [T, H/128]
     A_scale_exp = A_scale.unsqueeze(-1).expand(T, nhb, BLOCK).reshape(T, H)
-    A = (hidden_states.to(torch.float32) * A_scale_exp).to(COMPUTE_DTYPE)        # [T, H]
+    return (hidden_states.to(torch.float32) * A_scale_exp).to(COMPUTE_DTYPE)    # [T, H]
 
-    # ---- 2) no-aux routing (fp32) ----
+
+def _route(routing_logits, routing_bias, routed_scaling_factor):
+    """DeepSeek no-aux routing (fp32). Returns (topk_idx [T,8], weights [T,E]).
+    sigmoid(logits)+bias; group 256 experts into 8 groups; per-group sum of top-2; keep top-4 groups;
+    global top-8 by (s+bias); weights from the *unbiased* s over the selected experts, normalized
+    (+1e-20) and scaled by routed_scaling_factor."""
+    T = routing_logits.shape[0]
     logits = routing_logits.to(torch.float32)
     bias = routing_bias.to(torch.float32).reshape(-1)
     s = torch.sigmoid(logits)                                  # [T, E]
@@ -175,11 +162,44 @@ def run(
     Mmask = torch.zeros_like(s).scatter_(1, topk_idx, 1.0)
     weights = s * Mmask
     weights = (weights / (weights.sum(dim=1, keepdim=True) + 1e-20)) * routed_scaling_factor  # [T, E]
+    return topk_idx, weights
+
+
+def _swiglu_contiguous(G1):
+    """Contiguous-half SwiGLU: C = silu(G1[:, I:]) * G1[:, :I]  (NOT the interleaved ::2/1::2 order)."""
+    return (torch.nn.functional.silu(G1[:, I:].float()) * G1[:, :I].float()).to(COMPUTE_DTYPE)
+
+
+def run(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm2_weights,
+    gemm2_weights_scale,
+    local_expert_offset,
+    routed_scaling_factor,
+):
+    device = hidden_states.device
+    T = routing_logits.shape[0]
+    E_local = gemm1_weights.shape[0]
+    if isinstance(local_expert_offset, torch.Tensor):
+        local_start = int(local_expert_offset.item())
+    else:
+        local_start = int(local_expert_offset)
+    if isinstance(routed_scaling_factor, torch.Tensor):
+        routed_scaling_factor = float(routed_scaling_factor.item())
+
+    # ---- 1) dequant hidden states -> bf16 [T, H] ----
+    A = _dequant_hidden(hidden_states, hidden_states_scale)
+
+    # ---- 2) no-aux routing (fp32) ----
+    topk_idx, weights = _route(routing_logits, routing_bias, routed_scaling_factor)
 
     # ---- 3) local expert compute ----
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
-    nib = I // BLOCK                       # 16
-    ngb = (2 * I) // BLOCK                 # 32
 
     # Default path: fused Triton block-scale dequant (`_dequant` -> bf16, 5x less memory traffic than
     # the torch path's fp32 temporaries) + rocBLAS bf16 matmul. The dequant dominated the profile
@@ -210,9 +230,7 @@ def run(
         else:
             W13_e = _dequant(gemm1_weights[le], gemm1_weights_scale[le])            # [2I, H]
             G1 = A_e.matmul(W13_e.t())
-        X1 = G1[:, :I]
-        X2 = G1[:, I:]
-        C = (torch.nn.functional.silu(X2.float()) * X1.float()).to(COMPUTE_DTYPE)  # [Tk, I]
+        C = _swiglu_contiguous(G1)                            # [Tk, I]
         if use_fused:
             O = _blockscale_gemm(C, gemm2_weights[le], gemm2_weights_scale[le]).float()  # [Tk, H]
         else:
