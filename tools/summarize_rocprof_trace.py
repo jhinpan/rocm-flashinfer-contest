@@ -39,31 +39,33 @@ STAGE_RULES = {
 def classify(name, rules):
     for stage, cls, subs in rules:
         if any(s in name for s in subs):
-            return stage, cls
-    return "other", "other"
+            return stage, cls, "|".join(subs)
+    return "other", "other", ""
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trace_csv")
     ap.add_argument("--kernel", required=True, choices=list(STAGE_RULES))
+    ap.add_argument("--bucket", default="?", help="bucket label (min/med/max) for the bucket column")
     args = ap.parse_args()
     rules = STAGE_RULES[args.kernel]
     rows = list(_csv.DictReader(open(args.trace_csv)))
     agg = defaultdict(lambda: [0, 0.0])   # stage -> [launches, total_us]
-    cls_of = {}
+    meta = {}                             # stage -> (class, kernel_pattern)
     tot = 0.0
     for r in rows:
         dur = (float(r["End_Timestamp"]) - float(r["Start_Timestamp"])) / 1000.0  # us
-        stage, cls = classify(r["Kernel_Name"], rules)
+        stage, cls, pat = classify(r["Kernel_Name"], rules)
         agg[stage][0] += 1
         agg[stage][1] += dur
-        cls_of[stage] = cls
+        meta[stage] = (cls, pat)
         tot += dur
     print(f"# {args.trace_csv}  ({len(rows)} dispatches, {tot:.0f} us total)")
-    print("stage,class,launches,total_us,avg_us,pct")
+    print("bucket,stage,kernel_pattern,launches,total_us,avg_us,pct,class")
     for stage, (n, t) in sorted(agg.items(), key=lambda x: -x[1][1]):
-        print(f"{stage},{cls_of[stage]},{n},{t:.1f},{t/n:.2f},{100*t/tot:.1f}")
+        cls, pat = meta[stage]
+        print(f"{args.bucket},{stage},{pat},{n},{t:.1f},{t/n:.2f},{100*t/tot:.1f},{cls}")
 
 
 if __name__ == "__main__":
