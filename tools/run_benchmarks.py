@@ -110,7 +110,7 @@ def collect_provenance(device):
 
 
 # Env vars that switch a solution's internal path — must be recorded so a result is reproducible.
-_SOL_ENV_VARS = ("MOE_USE_FUSED", "MOE_USE_DEQUANT", "DSA_USE_AITER", "DSA_TOPK_FAST",
+_SOL_ENV_VARS = ("MOE_USE_FUSED", "MOE_DEQUANT_TORCH", "DSA_USE_AITER", "DSA_TOPK_FAST",
                  "GDN_DECODE_FUSEDOP", "GDN_DECODE_RECURRENT", "GDN_DECODE_CONTIG_STATE",
                  "GDN_PREFILL_RECURRENT", "GDN_PREFILL_CHUNK_MIN")
 

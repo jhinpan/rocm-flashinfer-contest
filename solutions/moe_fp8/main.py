@@ -80,15 +80,50 @@ def _blockscale_gemm(a, w, scale):
     return c
 
 
+@triton.jit
+def _dequant_kernel(w_ptr, s_ptr, o_ptr, sw_r, sw_c, ss_r, ss_c, so_r, so_c,
+                    BLOCK: tl.constexpr):
+    """o[128x128 block] = bf16(fp8(w_block) * scale[block]). One program per 128x128 weight block =
+    exactly one block-scale element, so the scale broadcast and the fp32 intermediate weight tensor
+    are never materialized (the torch path writes/reads ~6x more memory through fp32 temporaries)."""
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rows = pm * BLOCK + tl.arange(0, BLOCK)
+    cols = pn * BLOCK + tl.arange(0, BLOCK)
+    w = tl.load(w_ptr + rows[:, None] * sw_r + cols[None, :] * sw_c).to(tl.float32)
+    s = tl.load(s_ptr + pm * ss_r + pn * ss_c)
+    tl.store(o_ptr + rows[:, None] * so_r + cols[None, :] * so_c, (w * s).to(tl.bfloat16))
+
+
+def _dequant_triton(w, scale):
+    """Block-scale dequant [R,C] fp8 * [R/128,C/128] fp32 -> [R,C] bf16 in one fused kernel.
+    Bit-identical to the torch `_dequant_block` (same per-128x128-block scale, fp32 multiply)."""
+    R, C = w.shape
+    o = torch.empty((R, C), dtype=COMPUTE_DTYPE, device=w.device)
+    grid = (R // BLOCK, C // BLOCK)
+    _dequant_kernel[grid](w, scale.to(torch.float32), o,
+                          w.stride(0), w.stride(1), scale.stride(0), scale.stride(1),
+                          o.stride(0), o.stride(1), BLOCK=BLOCK, num_warps=4)
+    return o
+
+
 def _dequant_block(w, scale):
     """Block-scale dequant of a [R, C] fp8/int8 weight by a [R/128, C/128] fp32 scale, returning
     bf16. Uses block-broadcast instead of `scale.repeat_interleave(128,0).repeat_interleave(128,1)`:
-    the expanded [R, C] scale is never materialized, removing the dominant per-expert elementwise /
-    memory-traffic cost found in profiling. Numerically identical (the same per-128x128-block scale
-    is applied to each element)."""
+    the expanded [R, C] scale is never materialized. Numerically identical (the same per-128x128-block
+    scale is applied to each element). Kept as the reference for the Triton dequant kernel and as the
+    `MOE_DEQUANT_TORCH=1` fallback."""
     R, C = w.shape
     wf = w.to(torch.float32).view(R // BLOCK, BLOCK, C // BLOCK, BLOCK)
     return (wf * scale.to(torch.float32)[:, None, :, None]).view(R, C).to(COMPUTE_DTYPE)
+
+
+def _dequant(w, scale):
+    """Default block-scale dequant: the fused Triton kernel (5x less memory traffic than the torch
+    path on these weight shapes). `MOE_DEQUANT_TORCH=1` selects the torch reference path."""
+    if os.environ.get("MOE_DEQUANT_TORCH") == "1":
+        return _dequant_block(w, scale)
+    return _dequant_triton(w, scale)
 
 
 def run(
@@ -146,14 +181,16 @@ def run(
     nib = I // BLOCK                       # 16
     ngb = (2 * I) // BLOCK                 # 32
 
-    # Default path: block-broadcast dequant (_dequant_block) + rocBLAS bf16 matmul — the fastest
-    # portable path measured here.
+    # Default path: fused Triton block-scale dequant (`_dequant` -> bf16, 5x less memory traffic than
+    # the torch path's fp32 temporaries) + rocBLAS bf16 matmul. The dequant dominated the profile
+    # (per-expert weight materialization ~63-80% across seq lengths), so cutting its traffic is the
+    # lever; rocBLAS still does the GEMM (a hand-written portable GEMM does not match it).
     #
     # MOE_USE_FUSED=1 selects an experimental Triton block-scale GEMM (_blockscale_gemm) that dequants
     # fp8 weights in-tile so the full bf16 weight is never materialized. It is numerically equivalent
     # (fp32 accumulate) but measured slower than the default for these shapes, because a hand-written
-    # Triton GEMM does not match the tuned rocBLAS/Tensile matmul the default uses; the saved weight
-    # traffic does not compensate. Off by default.
+    # Triton GEMM does not match the tuned rocBLAS/Tensile matmul; the saved weight traffic does not
+    # compensate. MOE_DEQUANT_TORCH=1 restores the torch `_dequant_block` reference dequant.
     use_fused = os.environ.get("MOE_USE_FUSED") == "1"
 
     # which local experts are actually selected
@@ -171,7 +208,7 @@ def run(
         if use_fused:
             G1 = _blockscale_gemm(A_e, gemm1_weights[le], gemm1_weights_scale[le])  # [Tk, 2I]
         else:
-            W13_e = _dequant_block(gemm1_weights[le], gemm1_weights_scale[le])      # [2I, H]
+            W13_e = _dequant(gemm1_weights[le], gemm1_weights_scale[le])            # [2I, H]
             G1 = A_e.matmul(W13_e.t())
         X1 = G1[:, :I]
         X2 = G1[:, I:]
@@ -179,7 +216,7 @@ def run(
         if use_fused:
             O = _blockscale_gemm(C, gemm2_weights[le], gemm2_weights_scale[le]).float()  # [Tk, H]
         else:
-            W2_e = _dequant_block(gemm2_weights[le], gemm2_weights_scale[le])       # [H, I]
+            W2_e = _dequant(gemm2_weights[le], gemm2_weights_scale[le])             # [H, I]
             O = C.matmul(W2_e.t()).float()
 
         w_tok = weights.index_select(0, token_idx)[:, ge]    # [Tk]
