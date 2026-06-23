@@ -92,8 +92,10 @@ def collect_provenance(device):
         "commit": _git("rev-parse", "HEAD"),
         "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
         "describe": _git("describe", "--tags", "--always", "--dirty"),
-        # peeled baseline commit (the actual code being compared against), not the tag object
-        "baseline_commit": _git("rev-parse", "--short", BASELINE_REF),
+        # primary comparison base (peeled commit of the selected --baseline-ref) + the contest v1 base
+        "primary_baseline_ref": BASELINE_REF,
+        "primary_baseline_commit": _git("rev-parse", "--short", BASELINE_REF),
+        "baseline_v1_commit": _git("rev-parse", "--short", "baseline-v1^{}"),
         "dirty": "yes" if _git("status", "--porcelain") else "no",
         "gpu": torch.cuda.get_device_name(0),
         "device": device,
@@ -117,9 +119,9 @@ def _sol_env():
     return ", ".join(f"{k}={v}" for k, v in on.items()) if on else "(defaults)"
 
 
-_PROV_FIELDS = ("timestamp_utc", "command", "commit", "branch", "describe", "baseline_commit",
-                "dirty", "gpu", "device", "torch", "hip", "triton", "aiter", "dataset", "fib_cache",
-                "sol_env")
+_PROV_FIELDS = ("timestamp_utc", "command", "commit", "branch", "describe", "primary_baseline_ref",
+                "primary_baseline_commit", "baseline_v1_commit", "dirty", "gpu", "device", "torch",
+                "hip", "triton", "aiter", "dataset", "fib_cache", "sol_env")
 
 
 def provenance_md(p):
@@ -288,7 +290,11 @@ def main():
             run = load_run(ROOT / "solutions" / sdir / "main.py")
         base_run = None if args.no_baseline_compare else load_baseline_run(sdir, tmpdir)
         if base_run is None and not args.no_baseline_compare:
-            print(f"  (warn: no baseline-v1 solution for {sdir}; candidate-vs-baseline blank)")
+            print(f"  (warn: no {BASELINE_REF} solution for {sdir}; primary-baseline columns blank)")
+        # Also time baseline/v1 (the contest denominator) when the primary base is not already v1.
+        base_v1_run = None
+        if not args.no_baseline_compare and BASELINE_REF != "baseline-v1^{}":
+            base_v1_run = load_run_from_ref(sdir, "baseline-v1^{}", tmpdir, "basev1")
         wls = [w.workload for w in ts.workloads[defn]]
         for w in pick_buckets(wls, axis, 3):
             safe = (load_safetensors(definition, w, root)
@@ -331,15 +337,21 @@ def main():
                     sol_runs.append(time_runnable(run, clone_args(inp), 5, iters, dev))
             sol_ms = _stats.median(sol_runs)
             base_ms = _stats.median(base_runs) if base_runs else None
-            cvb = (base_ms / sol_ms) if base_ms else None            # candidate-vs-baseline (>1 = faster)
+            cvb = (base_ms / sol_ms) if base_ms else None            # candidate-vs-primary-base (>1 = faster)
             red = (100.0 * (1 - sol_ms / base_ms)) if base_ms else None  # latency reduction %
+            # baseline/v1 timing (contest denominator), if distinct from the primary base.
+            base_v1_ms = time_runnable(base_v1_run, clone_args(inp), 5, iters, dev) if base_v1_run else None
+            cvb_v1 = (base_v1_ms / sol_ms) if base_v1_ms else (cvb if BASELINE_REF == "baseline-v1^{}" else None)
+            red_v1 = (100.0 * (1 - sol_ms / base_v1_ms)) if base_v1_ms else (red if BASELINE_REF == "baseline-v1^{}" else None)
             rows.append(dict(kernel=defn, sdir=sdir, axes=dict(w.axes), ref_ms=ref_ms, sol_ms=sol_ms,
                              sol_min=min(sol_runs), sol_max=max(sol_runs),
                              base_ms=base_ms,
                              base_min=(min(base_runs) if base_runs else None),
                              base_max=(max(base_runs) if base_runs else None),
-                             cvb=cvb, red=red, speedup=ref_ms / sol_ms, ok=ok, mr=mr_v))
-            extra = (f" base={base_ms:8.3f} cvb={cvb:5.2f}x red={red:+5.1f}%"
+                             cvb=cvb, red=red, base_v1_ms=base_v1_ms, cvb_v1=cvb_v1, red_v1=red_v1,
+                             speedup=ref_ms / sol_ms, ok=ok, mr=mr_v))
+            v1x = (f" v1={base_v1_ms:8.3f} cvb_v1={cvb_v1:5.2f}x" if base_v1_ms else "")
+            extra = (f" base={base_ms:8.3f} cvb={cvb:5.2f}x red={red:+5.1f}%{v1x}"
                      if base_ms else " base=  n/a")
             print(f"{sdir:22s} {str(dict(w.axes)):42s} ref={ref_ms:9.3f} sol={sol_ms:8.3f}"
                   f"[{min(sol_runs):.3f},{max(sol_runs):.3f}]{extra} "
@@ -350,38 +362,47 @@ def main():
     def fmt(x, p=4):
         return f"{x:.{p}f}" if x is not None else ""
 
+    # Primary base label, e.g. "baseline-v2" from ref "baseline-v2^{}".
+    pbase = BASELINE_REF.replace("^{}", "")
     csv = out.with_suffix(".csv")
     with open(csv, "w") as f:
         # full provenance as leading comment lines (one field per line for grep-ability)
         for k in _PROV_FIELDS:
             f.write(f"# {k}={prov[k]}\n")
-        f.write("kernel,axes,ref_ms,sol_ms,sol_ms_min,sol_ms_max,baseline_solution_ms,"
-                "baseline_ms_min,baseline_ms_max,candidate_vs_baseline,latency_reduction_pct,"
-                "speedup_vs_ref,correctness,matched_ratio\n")
+        f.write(f"kernel,axes,ref_ms,sol_ms,sol_ms_min,sol_ms_max,"
+                f"{pbase}_ms,{pbase}_ms_min,{pbase}_ms_max,candidate_vs_{pbase},"
+                f"latency_reduction_vs_{pbase}_pct,"
+                f"baseline_v1_ms,candidate_vs_baseline_v1,latency_reduction_vs_baseline_v1_pct,"
+                f"speedup_vs_ref,correctness,matched_ratio\n")
         for r in rows:
             f.write(f"{r['kernel']},\"{r['axes']}\",{r['ref_ms']:.4f},{r['sol_ms']:.4f},"
                     f"{fmt(r['sol_min'])},{fmt(r['sol_max'])},{fmt(r['base_ms'])},"
                     f"{fmt(r['base_min'])},{fmt(r['base_max'])},{fmt(r['cvb'],3)},{fmt(r['red'],2)},"
+                    f"{fmt(r['base_v1_ms'])},{fmt(r['cvb_v1'],3)},{fmt(r['red_v1'],2)},"
                     f"{r['speedup']:.3f},{'PASS' if r['ok'] else 'FAIL'},{r['mr']:.4f}\n")
     md = out.with_suffix(".md")
     with open(md, "w") as f:
         f.write(f"# Benchmark results — {plat}\n\n")
-        f.write("`speedup_vs_ref` = torch-reference latency / solution latency (same reference on "
-                "every platform).\n"
-                "`cand/base` = baseline-v1 solution latency / candidate latency (>1 = candidate "
-                "faster). `Δlat%` = latency reduction vs baseline-v1 (positive = faster).\n\n")
+        f.write(f"`speedup_vs_ref` = torch-reference latency / solution latency.\n"
+                f"`cand/{pbase}` = {pbase} solution latency / candidate latency (>1 = candidate "
+                f"faster); `Δ vs {pbase}` = latency reduction vs {pbase}.\n"
+                f"`cand/v1` / `Δ vs v1` = same against the contest base `baseline/v1`.\n\n")
         f.write(provenance_md(prov))
-        f.write("| Kernel | Workload | reference ms | solution ms (min–max) | baseline-v1 ms | "
-                "cand/base | Δlat% | speedup_vs_ref | correctness |\n")
-        f.write("|---|---|---:|---:|---:|---:|---:|---:|:--:|\n")
+        f.write(f"| Kernel | Workload | reference ms | solution ms (min–max) | {pbase} ms | "
+                f"cand/{pbase} | Δ vs {pbase} | baseline-v1 ms | cand/v1 | Δ vs v1 | "
+                f"speedup_vs_ref | correctness |\n")
+        f.write("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--:|\n")
         for r in rows:
             cvb = f"{r['cvb']:.2f}×" if r['cvb'] is not None else "—"
             red = f"{r['red']:+.1f}%" if r['red'] is not None else "—"
             base = (f"{r['base_ms']:.3f} ({r['base_min']:.3f}–{r['base_max']:.3f})"
                     if r['base_ms'] is not None else "—")
+            bv1 = f"{r['base_v1_ms']:.3f}" if r['base_v1_ms'] is not None else "—"
+            cvb1 = f"{r['cvb_v1']:.2f}×" if r['cvb_v1'] is not None else "—"
+            red1 = f"{r['red_v1']:+.1f}%" if r['red_v1'] is not None else "—"
             sol = f"{r['sol_ms']:.3f} ({r['sol_min']:.3f}–{r['sol_max']:.3f})"
             f.write(f"| `{r['sdir']}` | {r['axes']} | {r['ref_ms']:.3f} | "
-                    f"{sol} | {base} | {cvb} | {red} | "
+                    f"{sol} | {base} | {cvb} | {red} | {bv1} | {cvb1} | {red1} | "
                     f"**{r['speedup']:.2f}×** | {'✅' if r['ok'] else '❌'} |\n")
     print(f"\nwrote {md} and {csv}")
 
