@@ -2,7 +2,7 @@
 
 A **ROCm / AMD Instinct MI300X** port of the five
 [MLSys 2026 FlashInfer contest](https://github.com/mit-han-lab/mlsys2026-flashinfer-contest)
-kernels, with an apples-to-apples **NVIDIA-vs-AMD** comparison harness.
+kernels, optimized vs the contest's torch `reference` and locked baselines.
 
 The contest ships kernel *definitions* (a pure-torch `reference` that is both the correctness
 oracle and the speedup denominator), NVIDIA *baselines* (`flashinfer` / `deep_gemm` / CUTLASS
@@ -76,40 +76,6 @@ behind `DSA_TOPK_FAST=1`).
 The loop converged in **7 rounds (budget 12)**, exited *complete*, and its code-review reviewer
 caught only substantive issues (≈zero false positives); see the methodology view in the summary.
 
-## NVIDIA vs AMD
-
-The contest's headline metric, `speedup = reference_latency / solution_latency`, is **directly
-comparable across vendors** because the `reference` is the *same torch code* on every platform.
-The table below pairs each NVIDIA contest baseline with the ROCm solution here.
-
-| Kernel | NVIDIA baseline op (contest) | Runs on MI300? | AMD ROCm solution | AMD speedup vs ref | NVIDIA speedup vs ref |
-|--------|------------------------------|:--:|-------------------|:--:|:--:|
-| `gdn_decode` | `flashinfer.gdn_decode.gated_delta_rule_decode_pretranspose` (CUDA) | ❌ | AITER `fused_recurrent_gated_delta_rule` | 12–578× | ⏳ run on NV |
-| `gdn_prefill` | FlashInfer Blackwell CuTe `chunk_gated_delta_rule` (SM100) | ❌ | AITER `fused_recurrent_gated_delta_rule` (varlen) | 9–537× | ⏳ run on NV |
-| `dsa_sparse_attention` | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` (CUDA) | ❌ | AITER `unified_attention_sparse_mla` | 1.0–3.7× | ⏳ run on NV |
-| `dsa_topk_indexer_fp8` | `deep_gemm.fp8_paged_mqa_logits` + `flashinfer.top_k_page_table_transform` | ❌ | vectorized fp32 dequant + top-k | 2.4–20× | ⏳ run on NV |
-| `moe_fp8_block_scale` | `flashinfer.fused_moe.trtllm_fp8_block_scale_moe` (CUDA, SM100) | ❌ | torch routing + per-expert bf16 GEMM | 1.2–3.8× | ⏳ run on NV |
-
-### Why the NVIDIA column is not filled in here
-
-**We do not have an NVIDIA GPU in this environment** (it is an MI300X box), and the contest does
-not publish per-kernel reference/solution latencies — so there are no honest NVIDIA numbers to
-report, and we deliberately do not fabricate them. Every NVIDIA baseline op above is CUDA / SM90 /
-SM100 and does **not** run on ROCm (confirmed: the ops are absent from the
-[ROCm flashinfer fork](https://github.com/ROCm/flashinfer/tree/amd-integration), and `deep_gemm`
-/ TensorRT-LLM cubins are CUDA-only).
-
-The comparison harness is fully symmetric, so the NVIDIA column is **one command away on NVIDIA
-hardware**:
-
-```bash
-# on an NVIDIA box (e.g. B200) with flashinfer + deep_gemm installed:
-python tools/run_benchmarks.py --out results/nvidia_b200 --baseline
-```
-
-`--baseline` additionally times the contest's NVIDIA `flashinfer_wrapper_*` baseline solutions
-(skipped automatically on ROCm). PRs adding `results/nvidia_*.md` are welcome.
-
 ## Layout
 
 ```
@@ -165,8 +131,9 @@ FIB_CACHE_PATH=/tmp/fib_cache python tools/local_verify.py \
 
 ## Caveats
 
-- Speedups are **vs the unoptimized torch reference** (the contest denominator), not vs an
-  NVIDIA kernel. A true cross-vendor number needs the NVIDIA column (see above).
+- Speedups are **vs the unoptimized torch reference** (the contest denominator) and the locked
+  `baseline/v1` / `baseline-v2` tags, not vs an NVIDIA kernel — the NVIDIA baseline ops are CUDA /
+  SM90 / SM100 and do not run on ROCm, so no cross-vendor latency is reported here.
 - `dsa_sparse_attention` is ~1× at the smallest shape because the AITER kernel is explicitly
   "not optimized" — the largest Phase-3 headroom (see `docs/ROADMAP.md`).
 - `moe_fp8_block_scale` is CUDA-mandated for the NVIDIA submission; this is a portable python
