@@ -23,8 +23,8 @@ current (v3) state.
 
 | # | Kernel | Correctness (official `verify.py`) | speedup vs torch reference | vs `baseline/v1` (contest) | v3 gain vs `baseline-v2` |
 |---|--------|:--:|--|--|--|
-| 1 | `gdn_decode` | ✅ 54/54 | **48× – 3700×** (grows with batch) | **3.8× – 6.1×** | **+64 – 79%** (k-last, no transposes) |
-| 2 | `gdn_prefill` | ✅ 100/100 | **9× – ~3500×** (grows with seq len) | **+84.8%** (long seq) | ≈0% (untouched) |
+| 1 | `gdn_decode` | ✅ 54/54 | **48× – 3718×** † | **3.8× – 6.1×** | **+64 – 79%** (k-last, no transposes) |
+| 2 | `gdn_prefill` | ✅ 100/100 | **9× – 3559×** † | **+84.8%** (long seq) | ≈0% (untouched) |
 | 3 | `dsa_sparse_attention` | ✅ 23/23 | 3.4× – 12.3× | **+70%** | ≈0% (untouched) |
 | 4 | `dsa_topk_indexer_fp8` | ✅ 128/128 | 2.2× – 20× | ~1.0× (mr 1.0 default) | robustness fix¹ |
 | 5 | `moe_fp8_block_scale` | ✅ 19/19 (loose tol) | 1.5× – 4.5× | **1.14× – 1.51×** | **+3 to +24%** (fused dequant) |
@@ -32,6 +32,32 @@ current (v3) state.
 ¹ `dsa_topk_indexer` default is the exact `torch.bmm` path (per-run matched-ratio 1.0, restoring v2's
 0.988–0.992). A faster packed-page kernel (`DSA_TOPK_FAST=1`) is **+10–21%** vs baseline-v2 and passes
 the official 128/128, but lands at mr ~0.99, so it ships behind a flag rather than as the default.
+
+### † Reading the speedup-vs-reference numbers (why two of them reach thousands×)
+
+The hundreds-to-thousands× figures are **arithmetically real** but must be read correctly — they say
+"how much faster than the contest's *unoptimized* torch oracle," **not** "faster than a good GPU
+kernel." The contest `reference` implements the gated-delta-rule **recurrence in eager PyTorch**:
+it steps token-by-token (the recurrence is serial) and, for decode, loops over the batch — launching
+thousands of tiny kernels with full Python/dispatch overhead. So its cost scales ~linearly with
+batch×sequence and becomes pathological at scale. Exact measured cases from
+[`results/amd_mi300.md`](results/amd_mi300.md):
+
+| case | torch `reference` | our solution | ratio |
+|---|--:|--:|--:|
+| `gdn_decode`, batch=1 | 1.83 ms | 0.038 ms | **48×** |
+| `gdn_decode`, batch=16 | 28.2 ms | 0.033 ms | **843×** |
+| `gdn_decode`, batch=64 | **110.4 ms** | 0.030 ms | **3718×** |
+| `gdn_prefill`, total_seq=6 | 1.54 ms | 0.168 ms | **9×** |
+| `gdn_prefill`, total_seq=8192 | **1879.9 ms** (≈1.9 s) | 0.528 ms | **3559×** |
+
+Two things make this honest rather than a stunt: (1) at small sizes the ratio **collapses** to 9–48×,
+because the reference isn't yet pathological there — the blow-up is purely the reference scaling, not
+our kernel doing anything magical; (2) the number that reflects **actual kernel engineering** is *vs
+the locked baselines* (already AITER-backed, reasonable implementations), where the same kernels are
+**3.8–6.1× vs `baseline/v1`** / **+64–79% vs `baseline-v2`** (decode) and **up to 6.6× vs v1** on long
+prefill. Those vs-baseline numbers are the defensible wins; the vs-reference column is just the
+contest's official (and very forgiving) denominator.
 
 **📋 Full write-up — content, results, and RLCR findings:**
 [**`results/v3-summary.md`**](results/v3-summary.md). Raw numbers:
@@ -75,6 +101,42 @@ behind `DSA_TOPK_FAST=1`).
 
 The loop converged in **7 rounds (budget 12)**, exited *complete*, and its code-review reviewer
 caught only substantive issues (≈zero false positives); see the methodology view in the summary.
+
+### How the kernels evolved: v1 → v2 → v3
+
+![v1 to v2 to v3 evolution of the five kernels](docs/rlcr-evolution.svg)
+
+### Two loops, two plans — what optimized well, and the limits
+
+Each loop is the **same harness** (`rocm-KDA-pilot`) driven by a **different plan against a different
+immutable baseline**, so the two are independent and additive:
+
+| | Plan | Baseline | Scope | Extra gates |
+|---|---|---|---|---|
+| **v2** (loop 1) | plan A | `baseline/v1` | all 5 kernels | ≥20% latency reduction or evidence-backed NO-GO |
+| **v3** (loop 2) | plan B | `baseline-v2` (the shipped v2) | the 3 highest-headroom kernels | `>3–5%` above noise; `moe ≥20%` vs v1; `dsa_topk mr≥0.999` hard gate; no input/warmup caches; full official verify at finalize |
+
+**What optimized well, and why.** The big wins all came from removing a *structural* cost that a
+portable Triton kernel can delete without competing with the vendor GEMM:
+- a per-call full-cache rebuild (`dsa_sparse`, v2 +70%),
+- a serial recurrence replaced by a chunk-parallel path on long sequences (`gdn_prefill`, v2 +84.8%),
+- host-side gate compute then **both** state-transpose copies (`gdn_decode`, v2 +23–27% → v3 +64–79%),
+- fp32 weight-dequant traffic, cut by a fused fp8→bf16 dequant that still **feeds rocBLAS**
+  (`moe_fp8`, v2 +9–17% → v3 +3–24%).
+
+**Where it hit real limits (honest):**
+- **`dsa_topk_indexer` — a genuine ceiling.** The fast packed-page kernel is +10–21% and passes the
+  official gate, but a Triton `tl.dot` cannot bit-match `torch.bmm`, so at these inputs' extreme
+  dynamic range it mis-ranks ~0.5–1% of boundary tokens (matched-ratio ~0.99). "Faster" and "mr≈1.0"
+  are mutually exclusive here, so v3 ships the exact path by default (mr 1.0) and keeps the fast one
+  behind a flag — recorded as an evidence-backed **NO-GO**, not a forced win.
+- **`moe_fp8` at `seq_len=1` is only +3%** (marginal): one token is launch/routing-bound, so the
+  dequant win is a smaller share — and a hand-written fused GEMM **loses to rocBLAS**, so that lever
+  is a dead end (kept behind `MOE_USE_FUSED=1` purely as evidence).
+- **`dsa_sparse_attention` is ~1× at the smallest shape** because the underlying AITER kernel is
+  explicitly "not optimized" — the largest remaining headroom (see `docs/ROADMAP.md`).
+- **The vs-reference column is inflated by a pathological reference** (above); the honest metric is
+  vs-baseline, which is why both are reported side by side.
 
 ## Layout
 

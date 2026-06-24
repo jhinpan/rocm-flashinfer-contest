@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="700" viewBox="0 0 1100 700" font-family="-apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <rect width="1100" height="700" fill="#ffffff"/>
+  <!-- Title -->
+  <text x="20" y="30" font-size="20" font-weight="700" fill="#212529">ROCm/MI300X kernels: v1 → v2 → v3 (two RLCR loops driving rocm-KDA-pilot)</text>
+  <text x="20" y="52" font-size="12.5" fill="#868e96">Each loop = one plan + one immutable baseline. Cell % are vs the previous baseline; correctness gated by official verify.py every round.</text>
+
+  <!-- Column headers -->
+  <g font-size="13" font-weight="700">
+    <rect x="170" y="66" width="296" height="34" rx="6" fill="#e9ecef" stroke="#ced4da"/>
+    <text x="318" y="82" fill="#343a40" text-anchor="middle">v1 — initial ROCm port</text>
+    <text x="318" y="95" fill="#868e96" text-anchor="middle" font-weight="400" font-size="11">tag: baseline/v1 (the contest denominator)</text>
+
+    <rect x="474" y="66" width="296" height="34" rx="6" fill="#e3f1e8" stroke="#a9d6ba"/>
+    <text x="622" y="82" fill="#1b6e3a" text-anchor="middle">v2 — RLCR loop 1 (plan A)</text>
+    <text x="622" y="95" fill="#3f8a5b" text-anchor="middle" font-weight="400" font-size="11">5 kernels · base = baseline/v1 · ≥20% target</text>
+
+    <rect x="778" y="66" width="296" height="34" rx="6" fill="#d6efdd" stroke="#8ccfa3"/>
+    <text x="926" y="82" fill="#15592f" text-anchor="middle">v3 — RLCR loop 2 (plan B)</text>
+    <text x="926" y="95" fill="#2f7a4e" text-anchor="middle" font-weight="400" font-size="11">top-3 headroom · base = baseline-v2 · mr≥0.999 gate</text>
+  </g>
+
+  <!-- arrows between column headers -->
+  <g stroke="#adb5bd" stroke-width="2" fill="none" marker-end="url(#arrow)">
+    <path d="M468 83 L472 83"/>
+    <path d="M772 83 L776 83"/>
+  </g>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#adb5bd"/>
+    </marker>
+  </defs>
+
+  <!-- ================= ROWS ================= -->
+  <!-- Row template: label + 3 cells. row height 108, gap 8, first top=110 -->
+
+  <!-- gdn_decode (y=110) -->
+  <g>
+    <text x="20" y="150" font-size="13.5" font-weight="700" fill="#212529">gdn_decode</text>
+    <text x="20" y="168" font-size="10.5" fill="#868e96">single-token GDN decode</text>
+    <rect x="170" y="110" width="296" height="100" rx="6" fill="#f1f3f5" stroke="#ced4da"/>
+    <text x="184" y="132" font-size="11.5" fill="#495057">AITER recurrent kernel +</text>
+    <text x="184" y="148" font-size="11.5" fill="#495057">host-side gate compute</text>
+    <text x="184" y="164" font-size="11.5" fill="#495057">(exp / softplus / sigmoid),</text>
+    <text x="184" y="180" font-size="11.5" fill="#495057">2 host state-transpose copies.</text>
+    <rect x="474" y="110" width="296" height="100" rx="6" fill="#e6f4ea" stroke="#b7dfc3"/>
+    <text x="488" y="132" font-size="11.5" fill="#343a40">Fused sigmoid-gating delta</text>
+    <text x="488" y="148" font-size="11.5" fill="#343a40">kernel (gate moved into kernel);</text>
+    <text x="488" y="164" font-size="11.5" fill="#343a40">new state = transposed view.</text>
+    <rect x="488" y="174" width="118" height="22" rx="11" fill="#1b6e3a"/>
+    <text x="547" y="189" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">+23–27% vs v1</text>
+    <rect x="778" y="110" width="296" height="100" rx="6" fill="#d6efdd" stroke="#8ccfa3"/>
+    <text x="792" y="132" font-size="11.5" fill="#15592f">Custom k-last Triton kernel:</text>
+    <text x="792" y="148" font-size="11.5" fill="#15592f">reads + writes state in contest</text>
+    <text x="792" y="164" font-size="11.5" fill="#15592f">[B,HV,V,K] layout directly —</text>
+    <text x="792" y="180" font-size="11.5" fill="#15592f">both transposes removed.</text>
+    <rect x="792" y="186" width="120" height="20" rx="10" fill="#15592f"/>
+    <text x="852" y="200" font-size="11" font-weight="700" fill="#fff" text-anchor="middle">+64–79% vs v2</text>
+  </g>
+
+  <!-- gdn_prefill (y=218) -->
+  <g>
+    <text x="20" y="258" font-size="13.5" font-weight="700" fill="#212529">gdn_prefill</text>
+    <text x="20" y="276" font-size="10.5" fill="#868e96">varlen GDN prefill</text>
+    <rect x="170" y="218" width="296" height="100" rx="6" fill="#f1f3f5" stroke="#ced4da"/>
+    <text x="184" y="244" font-size="11.5" fill="#495057">fused_recurrent kernel —</text>
+    <text x="184" y="260" font-size="11.5" fill="#495057">serial per token, dominates</text>
+    <text x="184" y="276" font-size="11.5" fill="#495057">at long sequence length.</text>
+    <rect x="474" y="218" width="296" height="100" rx="6" fill="#e6f4ea" stroke="#b7dfc3"/>
+    <text x="488" y="244" font-size="11.5" fill="#343a40">Length dispatch: chunk-parallel</text>
+    <text x="488" y="260" font-size="11.5" fill="#343a40">chunk_gated_delta_rule for long</text>
+    <text x="488" y="276" font-size="11.5" fill="#343a40">seq, recurrent for short.</text>
+    <rect x="488" y="286" width="150" height="22" rx="11" fill="#1b6e3a"/>
+    <text x="563" y="301" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">+84.8% (long seq) vs v1</text>
+    <rect x="778" y="218" width="296" height="100" rx="6" fill="#f1f3f5" stroke="#ced4da"/>
+    <text x="792" y="252" font-size="11.5" fill="#868e96">Untouched this loop.</text>
+    <text x="792" y="268" font-size="11.5" fill="#868e96">Re-checked: non-regressed</text>
+    <text x="792" y="284" font-size="11.5" fill="#868e96">(≈1.00× vs v2).</text>
+  </g>
+
+  <!-- dsa_sparse_attention (y=326) -->
+  <g>
+    <text x="20" y="366" font-size="13.5" font-weight="700" fill="#212529">dsa_sparse</text>
+    <text x="20" y="382" font-size="13.5" font-weight="700" fill="#212529">_attention</text>
+    <text x="20" y="400" font-size="10.5" fill="#868e96">sparse MLA, paged KV</text>
+    <rect x="170" y="326" width="296" height="100" rx="6" fill="#f1f3f5" stroke="#ced4da"/>
+    <text x="184" y="352" font-size="11.5" fill="#495057">Rebuilds the full paged KV</text>
+    <text x="184" y="368" font-size="11.5" fill="#495057">cache via torch.cat every</text>
+    <text x="184" y="384" font-size="11.5" fill="#495057">call (~600 MB), O(num_pages).</text>
+    <rect x="474" y="326" width="296" height="100" rx="6" fill="#e6f4ea" stroke="#b7dfc3"/>
+    <text x="488" y="352" font-size="11.5" fill="#343a40">Self-contained Triton MLA</text>
+    <text x="488" y="368" font-size="11.5" fill="#343a40">kernel reads the two paged</text>
+    <text x="488" y="384" font-size="11.5" fill="#343a40">caches separately (no cat).</text>
+    <rect x="488" y="394" width="118" height="22" rx="11" fill="#1b6e3a"/>
+    <text x="547" y="409" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">+70% vs v1</text>
+    <rect x="778" y="326" width="296" height="100" rx="6" fill="#f1f3f5" stroke="#ced4da"/>
+    <text x="792" y="360" font-size="11.5" fill="#868e96">Untouched this loop.</text>
+    <text x="792" y="376" font-size="11.5" fill="#868e96">Re-checked: non-regressed</text>
+    <text x="792" y="392" font-size="11.5" fill="#868e96">(≈1.00× vs v2).</text>
+  </g>
+
+  <!-- dsa_topk_indexer (y=434) -->
+  <g>
+    <text x="20" y="474" font-size="13.5" font-weight="700" fill="#212529">dsa_topk</text>
+    <text x="20" y="490" font-size="13.5" font-weight="700" fill="#212529">_indexer</text>
+    <text x="20" y="508" font-size="10.5" fill="#868e96">fp8 top-2048 indexer</text>
+    <rect x="170" y="434" width="296" height="100" rx="6" fill="#f1f3f5" stroke="#ced4da"/>
+    <text x="184" y="460" font-size="11.5" fill="#495057">torch fp8 dequant + bmm +</text>
+    <text x="184" y="476" font-size="11.5" fill="#495057">relu + per-head weight sum</text>
+    <text x="184" y="492" font-size="11.5" fill="#495057">+ topk (matched-ratio 1.0).</text>
+    <rect x="474" y="434" width="296" height="100" rx="6" fill="#e6f4ea" stroke="#b7dfc3"/>
+    <text x="488" y="460" font-size="11.5" fill="#343a40">Fused-logits tl.dot kernel</text>
+    <text x="488" y="476" font-size="11.5" fill="#343a40">(no [B,H,N] materialization).</text>
+    <text x="488" y="492" font-size="11.5" fill="#9a6a00">but matched-ratio drops ~0.98.</text>
+    <rect x="488" y="500" width="130" height="22" rx="11" fill="#3f8a5b"/>
+    <text x="553" y="515" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">+5–8% vs v1 (mr↓)</text>
+    <rect x="778" y="434" width="296" height="100" rx="6" fill="#fdf2dd" stroke="#ecd9a6"/>
+    <text x="792" y="458" font-size="11.5" fill="#7a5b12">Robustness-first: default back to</text>
+    <text x="792" y="474" font-size="11.5" fill="#7a5b12">exact bmm (mr 1.0 restored).</text>
+    <text x="792" y="490" font-size="11.5" fill="#7a5b12">Fast packed-page path (+10–21%,</text>
+    <text x="792" y="506" font-size="11.5" fill="#7a5b12">mr~0.99) behind DSA_TOPK_FAST.</text>
+    <rect x="792" y="510" width="200" height="20" rx="10" fill="#b8860b"/>
+    <text x="892" y="524" font-size="11" font-weight="700" fill="#fff" text-anchor="middle">perf NO-GO (evidence-backed)</text>
+  </g>
+
+  <!-- moe_fp8 (y=542) -->
+  <g>
+    <text x="20" y="582" font-size="13.5" font-weight="700" fill="#212529">moe_fp8</text>
+    <text x="20" y="600" font-size="10.5" fill="#868e96">fp8 block-scale MoE</text>
+    <rect x="170" y="542" width="296" height="100" rx="6" fill="#f1f3f5" stroke="#ced4da"/>
+    <text x="184" y="568" font-size="11.5" fill="#495057">Dequant ALL experts up front</text>
+    <text x="184" y="584" font-size="11.5" fill="#495057">via repeat_interleave</text>
+    <text x="184" y="600" font-size="11.5" fill="#495057">(~5.6 GB fp32 weights).</text>
+    <rect x="474" y="542" width="296" height="100" rx="6" fill="#e6f4ea" stroke="#b7dfc3"/>
+    <text x="488" y="568" font-size="11.5" fill="#343a40">Block-broadcast dequant (no</text>
+    <text x="488" y="584" font-size="11.5" fill="#343a40">expand) + only the active</text>
+    <text x="488" y="600" font-size="11.5" fill="#343a40">experts; rocBLAS bf16 GEMM.</text>
+    <rect x="488" y="610" width="118" height="22" rx="11" fill="#1b6e3a"/>
+    <text x="547" y="625" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">+9–17% vs v1</text>
+    <rect x="778" y="542" width="296" height="100" rx="6" fill="#d6efdd" stroke="#8ccfa3"/>
+    <text x="792" y="568" font-size="11.5" fill="#15592f">Fused Triton fp8+scale → bf16</text>
+    <text x="792" y="584" font-size="11.5" fill="#15592f">dequant (no fp32 temps, ~5×</text>
+    <text x="792" y="600" font-size="11.5" fill="#15592f">less traffic); rocBLAS keeps GEMM.</text>
+    <rect x="792" y="610" width="120" height="20" rx="10" fill="#15592f"/>
+    <text x="852" y="624" font-size="11" font-weight="700" fill="#fff" text-anchor="middle">+3–24% vs v2</text>
+  </g>
+
+  <!-- footer -->
+  <text x="20" y="668" font-size="11" fill="#868e96">Green = shipped improvement · Amber = robustness-first / evidence-backed NO-GO · Gray = untouched (non-regression re-checked). All paths pass the full official verify.py.</text>
+  <text x="20" y="686" font-size="11" fill="#868e96">Cumulative vs the contest baseline/v1: gdn_decode 3.8–6.1× · gdn_prefill up to 6.6× (long seq) · dsa_sparse ~3.4× · dsa_topk ~1.0× (robust) · moe_fp8 1.14–1.51×.</text>
+</svg>
