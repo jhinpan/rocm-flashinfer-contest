@@ -1,0 +1,22 @@
+# timestamp_utc=2026-06-23 11:00:28Z
+# command=python tools/run_benchmarks.py --out results/v3_round4_dsatopk --repeat-runs 3 --baseline-ref baseline-v2^{} --only dsa_topk_indexer
+# commit=448fec4a61e4200a990fa1254911d79aeae7c2a9
+# branch=rlcr/optimize-5-kernels
+# describe=baseline-v2-16-g448fec4
+# primary_baseline_ref=baseline-v2^{}
+# primary_baseline_commit=08d4780
+# baseline_v1_commit=74c0918
+# dirty=no
+# gpu=AMD Instinct MI300X
+# device=cuda:0
+# torch=2.9.1+rocm7.2.0.git7e1940d4
+# hip=7.2.26015-fc0010cf6a
+# triton=3.6.0+git42270451
+# aiter=editable-source (/sgl-workspace/aiter/aiter@7d604afe5)
+# dataset=/sgl-workspace/workspace/mlsys2026-flashinfer-contest/data/flashinfer-trace
+# fib_cache=n/a
+# sol_env=(defaults)
+kernel,axes,ref_ms,sol_ms,sol_ms_min,sol_ms_max,baseline_v2_ms,baseline_v2_ms_min,baseline_v2_ms_max,candidate_vs_baseline_v2,latency_reduction_vs_baseline_v2_pct,baseline_v1_ms,baseline_v1_ms_min,baseline_v1_ms_max,candidate_vs_baseline_v1,latency_reduction_vs_baseline_v1_pct,speedup_vs_ref,correctness,matched_ratio
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 1, 'max_num_pages': 1, 'num_pages': 11923}",0.7374,0.3557,0.3512,0.3563,0.2986,0.2943,0.2999,0.840,-19.10,0.3146,0.3140,0.3155,0.885,-13.06,2.073,PASS,1.0000
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 14, 'max_num_pages': 40, 'num_pages': 11923}",3.2529,0.3422,0.3401,0.3428,0.3075,0.3068,0.3114,0.899,-11.29,0.3381,0.3358,0.4494,0.988,-1.21,9.505,PASS,1.0000
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 31, 'max_num_pages': 43, 'num_pages': 11923}",6.6507,0.3458,0.3439,0.3521,0.3208,0.3189,0.4064,0.928,-7.77,0.3334,0.3330,0.3343,0.964,-3.71,19.234,PASS,1.0000

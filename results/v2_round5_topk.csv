@@ -1,0 +1,32 @@
+# timestamp_utc=2026-06-22 22:37:07Z
+# command=python tools/run_benchmarks.py --out results/v2_round5_topk --repeat-runs 3
+# commit=a452f05bc2a37aaf1654371c8ffdeb8f206bbf1c
+# branch=rlcr/optimize-5-kernels
+# describe=baseline-v1-16-ga452f05-dirty
+# baseline_commit=74c0918
+# dirty=yes
+# gpu=AMD Instinct MI300X
+# device=cuda:0
+# torch=2.9.1+rocm7.2.0.git7e1940d4
+# hip=7.2.26015-fc0010cf6a
+# triton=3.6.0+git42270451
+# aiter=editable-source (/sgl-workspace/aiter/aiter@7d604afe5)
+# dataset=/sgl-workspace/workspace/mlsys2026-flashinfer-contest/data/flashinfer-trace
+# fib_cache=/tmp/fib_cache
+# sol_env=DSA_TOPK_FUSED=1
+kernel,axes,ref_ms,sol_ms,sol_ms_min,sol_ms_max,baseline_solution_ms,baseline_ms_min,baseline_ms_max,candidate_vs_baseline,latency_reduction_pct,speedup_vs_ref,correctness,matched_ratio
+gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 1}",1.8299,0.1457,0.1442,0.1476,0.1455,0.1442,0.1464,0.999,-0.14,12.559,PASS,1.0000
+gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 16}",27.2133,0.1428,0.1427,0.1430,0.1422,0.1421,0.1424,0.996,-0.44,190.509,PASS,1.0000
+gdn_decode_qk4_v8_d128_k_last,"{'batch_size': 64}",106.7364,0.1822,0.1820,0.1871,0.1825,0.1825,0.1829,1.002,0.16,585.708,PASS,1.0000
+gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 6, 'num_seqs': 1, 'len_cu_seqlens': 2}",1.5708,0.1647,0.1641,0.1650,0.1649,0.1640,0.1652,1.001,0.15,9.537,PASS,1.0000
+gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 139, 'num_seqs': 3, 'len_cu_seqlens': 4}",31.6010,0.1731,0.1730,0.1743,0.1731,0.1730,0.1732,1.000,0.02,182.587,PASS,1.0000
+gdn_prefill_qk4_v8_d128_k_last,"{'total_seq_len': 8192, 'num_seqs': 39, 'len_cu_seqlens': 40}",1844.6532,3.5729,3.5714,3.5808,3.5728,3.5722,3.5736,1.000,-0.00,516.286,PASS,1.0000
+dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 1, 'num_pages': 8462}",0.7942,0.2315,0.2302,0.2333,0.8041,0.8029,0.8052,3.473,71.21,3.431,PASS,1.0000
+dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 6, 'num_pages': 8462}",2.4067,0.2443,0.2435,0.2452,0.8251,0.8243,0.8273,3.378,70.40,9.852,PASS,1.0000
+dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64,"{'num_tokens': 8, 'num_pages': 8462}",3.0479,0.2448,0.2446,0.2464,0.8260,0.8252,0.8271,3.375,70.37,12.453,PASS,1.0000
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 1, 'max_num_pages': 1, 'num_pages': 11923}",0.7384,0.2908,0.2900,0.2911,0.3065,0.3045,0.3068,1.054,5.12,2.539,PASS,1.0000
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 14, 'max_num_pages': 40, 'num_pages': 11923}",3.1953,0.3030,0.3024,0.3038,0.3240,0.3223,0.3249,1.069,6.47,10.545,PASS,1.0000
+dsa_topk_indexer_fp8_h64_d128_topk2048_ps64,"{'batch_size': 31, 'max_num_pages': 43, 'num_pages': 11923}",6.4934,0.3084,0.3068,0.3102,0.3278,0.3233,0.3289,1.063,5.91,21.052,FAIL,0.9921
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 1}",11.3629,2.6437,2.6404,2.6488,2.9340,2.9273,2.9350,1.110,9.89,4.298,PASS,0.9909
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 55}",15.5886,10.4310,10.4119,10.4380,12.6990,12.6856,12.7037,1.217,17.86,1.494,PASS,0.9953
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 14107}",31.0522,19.0841,19.0763,19.0914,22.2054,22.1967,22.2100,1.164,14.06,1.627,PASS,0.9942

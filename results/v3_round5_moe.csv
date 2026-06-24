@@ -1,0 +1,22 @@
+# timestamp_utc=2026-06-23 11:26:41Z
+# command=python tools/run_benchmarks.py --out results/v3_round5_moe --repeat-runs 3 --baseline-ref baseline-v2^{} --only moe_fp8
+# commit=dc49716bba7e2dd95777c002534a1c9e30e92780
+# branch=rlcr/optimize-5-kernels
+# describe=baseline-v2-20-gdc49716
+# primary_baseline_ref=baseline-v2^{}
+# primary_baseline_commit=08d4780
+# baseline_v1_commit=74c0918
+# dirty=no
+# gpu=AMD Instinct MI300X
+# device=cuda:0
+# torch=2.9.1+rocm7.2.0.git7e1940d4
+# hip=7.2.26015-fc0010cf6a
+# triton=3.6.0+git42270451
+# aiter=editable-source (/sgl-workspace/aiter/aiter@7d604afe5)
+# dataset=/sgl-workspace/workspace/mlsys2026-flashinfer-contest/data/flashinfer-trace
+# fib_cache=n/a
+# sol_env=(defaults)
+kernel,axes,ref_ms,sol_ms,sol_ms_min,sol_ms_max,baseline_v2_ms,baseline_v2_ms_min,baseline_v2_ms_max,candidate_vs_baseline_v2,latency_reduction_vs_baseline_v2_pct,baseline_v1_ms,baseline_v1_ms_min,baseline_v1_ms_max,candidate_vs_baseline_v1,latency_reduction_vs_baseline_v1_pct,speedup_vs_ref,correctness,matched_ratio
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 1}",11.3845,2.5843,2.5769,2.6332,2.6636,2.6574,2.6652,1.031,2.98,2.9393,2.9331,2.9395,1.137,12.08,4.405,PASS,0.9879
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 55}",15.6320,9.3134,9.2540,9.3331,10.3872,10.3809,10.3913,1.115,10.34,12.6913,12.6739,12.6917,1.363,26.62,1.678,PASS,0.9951
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048,"{'seq_len': 14107}",30.8324,14.5181,14.5021,14.5492,19.0977,19.0969,19.1146,1.315,23.98,22.1874,22.1708,22.1964,1.528,34.57,2.124,PASS,0.9942

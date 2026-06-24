@@ -13,7 +13,11 @@ Routing (no-aux): sigmoid(logits); group 256 experts into 8 groups; per group su
 (with bias); keep top-4 groups; global top-8 by (s+bias); weights from unbiased s, normalized,
 scaled by routed_scaling_factor. SwiGLU gate = second half: C = silu(G1[:, I:]) * G1[:, :I].
 """
+import os
+
 import torch
+import triton
+import triton.language as tl
 
 H = 7168
 I = 2048
@@ -25,35 +29,119 @@ TOPK_GROUP = 4
 COMPUTE_DTYPE = torch.bfloat16
 
 
-def run(
-    routing_logits,
-    routing_bias,
-    hidden_states,
-    hidden_states_scale,
-    gemm1_weights,
-    gemm1_weights_scale,
-    gemm2_weights,
-    gemm2_weights_scale,
-    local_expert_offset,
-    routed_scaling_factor,
+@triton.jit
+def _blockscale_gemm_kernel(
+    a_ptr,        # [M, K] bf16
+    w_ptr,        # [N, K] fp8 (e4m3fn)
+    s_ptr,        # [N/128, K/128] fp32 block scales
+    c_ptr,        # [M, N] bf16  (= a @ dequant(w).T)
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wn, stride_wk,
+    stride_sn, stride_sk,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    device = hidden_states.device
-    T = routing_logits.shape[0]
-    E_local = gemm1_weights.shape[0]
-    nhb = H // BLOCK  # 56
-    if isinstance(local_expert_offset, torch.Tensor):
-        local_start = int(local_expert_offset.item())
-    else:
-        local_start = int(local_expert_offset)
-    if isinstance(routed_scaling_factor, torch.Tensor):
-        routed_scaling_factor = float(routed_scaling_factor.item())
+    """C = A @ dequant(W).T with per-128x128 block-scale dequant of W done IN-TILE (fp32 accumulate),
+    so the full dequantized bf16 weight is never materialized. BLOCK_N and BLOCK_K are 128 so each
+    [128,128] W tile maps to exactly one scale element. K and N are multiples of 128 (no K/N mask)."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    m_mask = offs_m < M
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    n_blk = pid_n  # BLOCK_N == 128
+    for k0 in range(0, K, BLOCK_K):
+        a = tl.load(a_ptr + offs_m[:, None] * stride_am + (k0 + offs_k)[None, :] * stride_ak,
+                    mask=m_mask[:, None], other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + offs_n[:, None] * stride_wn + (k0 + offs_k)[None, :] * stride_wk).to(tl.float32)
+        sc = tl.load(s_ptr + n_blk * stride_sn + (k0 // BLOCK_K) * stride_sk)
+        w = w * sc                                  # dequant this [128,128] block
+        acc += tl.dot(a, tl.trans(w))               # [BM,BK] @ [BK,BN]
+    tl.store(c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+             acc.to(tl.bfloat16), mask=m_mask[:, None])
 
-    # ---- 1) dequant hidden states -> bf16 [T, H] ----
+
+def _blockscale_gemm(a, w, scale):
+    """a:[M,K] bf16, w:[N,K] fp8, scale:[N/128,K/128] fp32 -> [M,N] bf16 = a @ dequant(w).T."""
+    M, K = a.shape
+    N = w.shape[0]
+    c = torch.empty((M, N), dtype=torch.bfloat16, device=a.device)
+    BLOCK_M = 32
+    grid = (triton.cdiv(M, BLOCK_M), N // 128)
+    _blockscale_gemm_kernel[grid](
+        a, w, scale, c, M, N, K,
+        a.stride(0), a.stride(1), w.stride(0), w.stride(1),
+        scale.stride(0), scale.stride(1), c.stride(0), c.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=128, BLOCK_K=128, num_warps=4, num_stages=1,
+    )
+    return c
+
+
+@triton.jit
+def _dequant_kernel(w_ptr, s_ptr, o_ptr, sw_r, sw_c, ss_r, ss_c, so_r, so_c,
+                    BLOCK: tl.constexpr):
+    """o[128x128 block] = bf16(fp8(w_block) * scale[block]). One program per 128x128 weight block =
+    exactly one block-scale element, so the scale broadcast and the fp32 intermediate weight tensor
+    are never materialized (the torch path writes/reads ~6x more memory through fp32 temporaries)."""
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rows = pm * BLOCK + tl.arange(0, BLOCK)
+    cols = pn * BLOCK + tl.arange(0, BLOCK)
+    w = tl.load(w_ptr + rows[:, None] * sw_r + cols[None, :] * sw_c).to(tl.float32)
+    s = tl.load(s_ptr + pm * ss_r + pn * ss_c)
+    tl.store(o_ptr + rows[:, None] * so_r + cols[None, :] * so_c, (w * s).to(tl.bfloat16))
+
+
+def _dequant_triton(w, scale):
+    """Block-scale dequant [R,C] fp8 * [R/128,C/128] fp32 -> [R,C] bf16 in one fused kernel.
+    Bit-identical to the torch `_dequant_block` (same per-128x128-block scale, fp32 multiply)."""
+    R, C = w.shape
+    o = torch.empty((R, C), dtype=COMPUTE_DTYPE, device=w.device)
+    grid = (R // BLOCK, C // BLOCK)
+    _dequant_kernel[grid](w, scale.to(torch.float32), o,
+                          w.stride(0), w.stride(1), scale.stride(0), scale.stride(1),
+                          o.stride(0), o.stride(1), BLOCK=BLOCK, num_warps=4)
+    return o
+
+
+def _dequant_block(w, scale):
+    """Block-scale dequant of a [R, C] fp8/int8 weight by a [R/128, C/128] fp32 scale, returning
+    bf16. Uses block-broadcast instead of `scale.repeat_interleave(128,0).repeat_interleave(128,1)`:
+    the expanded [R, C] scale is never materialized. Numerically identical (the same per-128x128-block
+    scale is applied to each element). Kept as the reference for the Triton dequant kernel and as the
+    `MOE_DEQUANT_TORCH=1` fallback."""
+    R, C = w.shape
+    wf = w.to(torch.float32).view(R // BLOCK, BLOCK, C // BLOCK, BLOCK)
+    return (wf * scale.to(torch.float32)[:, None, :, None]).view(R, C).to(COMPUTE_DTYPE)
+
+
+def _dequant(w, scale):
+    """Default block-scale dequant: the fused Triton kernel (5x less memory traffic than the torch
+    path on these weight shapes). `MOE_DEQUANT_TORCH=1` selects the torch reference path."""
+    if os.environ.get("MOE_DEQUANT_TORCH") == "1":
+        return _dequant_block(w, scale)
+    return _dequant_triton(w, scale)
+
+
+def _dequant_hidden(hidden_states, hidden_states_scale):
+    """Dequant the per-128-channel-block fp8 hidden states to bf16 [T, H].
+    hidden_states_scale is stored [H/128, T]; transpose to [T, H/128] and broadcast over the block."""
+    T = hidden_states.shape[0]
+    nhb = H // BLOCK
     A_scale = hidden_states_scale.to(torch.float32).permute(1, 0).contiguous()  # [T, H/128]
     A_scale_exp = A_scale.unsqueeze(-1).expand(T, nhb, BLOCK).reshape(T, H)
-    A = (hidden_states.to(torch.float32) * A_scale_exp).to(COMPUTE_DTYPE)        # [T, H]
+    return (hidden_states.to(torch.float32) * A_scale_exp).to(COMPUTE_DTYPE)    # [T, H]
 
-    # ---- 2) no-aux routing (fp32) ----
+
+def _route(routing_logits, routing_bias, routed_scaling_factor):
+    """DeepSeek no-aux routing (fp32). Returns (topk_idx [T,8], weights [T,E]).
+    sigmoid(logits)+bias; group 256 experts into 8 groups; per-group sum of top-2; keep top-4 groups;
+    global top-8 by (s+bias); weights from the *unbiased* s over the selected experts, normalized
+    (+1e-20) and scaled by routed_scaling_factor."""
+    T = routing_logits.shape[0]
     logits = routing_logits.to(torch.float32)
     bias = routing_bias.to(torch.float32).reshape(-1)
     s = torch.sigmoid(logits)                                  # [T, E]
@@ -74,11 +162,56 @@ def run(
     Mmask = torch.zeros_like(s).scatter_(1, topk_idx, 1.0)
     weights = s * Mmask
     weights = (weights / (weights.sum(dim=1, keepdim=True) + 1e-20)) * routed_scaling_factor  # [T, E]
+    return topk_idx, weights
+
+
+def _swiglu_contiguous(G1):
+    """Contiguous-half SwiGLU: C = silu(G1[:, I:]) * G1[:, :I]  (NOT the interleaved ::2/1::2 order)."""
+    return (torch.nn.functional.silu(G1[:, I:].float()) * G1[:, :I].float()).to(COMPUTE_DTYPE)
+
+
+def run(
+    routing_logits,
+    routing_bias,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm2_weights,
+    gemm2_weights_scale,
+    local_expert_offset,
+    routed_scaling_factor,
+):
+    device = hidden_states.device
+    T = routing_logits.shape[0]
+    E_local = gemm1_weights.shape[0]
+    if isinstance(local_expert_offset, torch.Tensor):
+        local_start = int(local_expert_offset.item())
+    else:
+        local_start = int(local_expert_offset)
+    if isinstance(routed_scaling_factor, torch.Tensor):
+        routed_scaling_factor = float(routed_scaling_factor.item())
+
+    # ---- 1) dequant hidden states -> bf16 [T, H] ----
+    A = _dequant_hidden(hidden_states, hidden_states_scale)
+
+    # ---- 2) no-aux routing (fp32) ----
+    topk_idx, weights = _route(routing_logits, routing_bias, routed_scaling_factor)
 
     # ---- 3) local expert compute ----
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
-    nib = I // BLOCK                       # 16
-    ngb = (2 * I) // BLOCK                 # 32
+
+    # Default path: fused Triton block-scale dequant (`_dequant` -> bf16, 5x less memory traffic than
+    # the torch path's fp32 temporaries) + rocBLAS bf16 matmul. The dequant dominated the profile
+    # (per-expert weight materialization ~63-80% across seq lengths), so cutting its traffic is the
+    # lever; rocBLAS still does the GEMM (a hand-written portable GEMM does not match it).
+    #
+    # MOE_USE_FUSED=1 selects an experimental Triton block-scale GEMM (_blockscale_gemm) that dequants
+    # fp8 weights in-tile so the full bf16 weight is never materialized. It is numerically equivalent
+    # (fp32 accumulate) but measured slower than the default for these shapes, because a hand-written
+    # Triton GEMM does not match the tuned rocBLAS/Tensile matmul; the saved weight traffic does not
+    # compensate. MOE_DEQUANT_TORCH=1 restores the torch `_dequant_block` reference dequant.
+    use_fused = os.environ.get("MOE_USE_FUSED") == "1"
 
     # which local experts are actually selected
     sel_global = topk_idx                  # [T, 8]
@@ -92,20 +225,17 @@ def run(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)                   # [Tk, H] bf16
 
-        # dequant this expert's weights to bf16
-        s13 = gemm1_weights_scale[le].to(torch.float32)      # [2I/128, H/128]
-        s13 = s13.repeat_interleave(BLOCK, 0).repeat_interleave(BLOCK, 1)   # [2I, H]
-        W13_e = (gemm1_weights[le].to(torch.float32) * s13).to(COMPUTE_DTYPE)  # [2I, H]
-
-        s2 = gemm2_weights_scale[le].to(torch.float32)       # [H/128, I/128]
-        s2 = s2.repeat_interleave(BLOCK, 0).repeat_interleave(BLOCK, 1)     # [H, I]
-        W2_e = (gemm2_weights[le].to(torch.float32) * s2).to(COMPUTE_DTYPE)   # [H, I]
-
-        G1 = A_e.matmul(W13_e.t())                           # [Tk, 2I]
-        X1 = G1[:, :I]
-        X2 = G1[:, I:]
-        C = (torch.nn.functional.silu(X2.float()) * X1.float()).to(COMPUTE_DTYPE)  # [Tk, I]
-        O = C.matmul(W2_e.t()).float()                       # [Tk, H]
+        if use_fused:
+            G1 = _blockscale_gemm(A_e, gemm1_weights[le], gemm1_weights_scale[le])  # [Tk, 2I]
+        else:
+            W13_e = _dequant(gemm1_weights[le], gemm1_weights_scale[le])            # [2I, H]
+            G1 = A_e.matmul(W13_e.t())
+        C = _swiglu_contiguous(G1)                            # [Tk, I]
+        if use_fused:
+            O = _blockscale_gemm(C, gemm2_weights[le], gemm2_weights_scale[le]).float()  # [Tk, H]
+        else:
+            W2_e = _dequant(gemm2_weights[le], gemm2_weights_scale[le])             # [H, I]
+            O = C.matmul(W2_e.t()).float()
 
         w_tok = weights.index_select(0, token_idx)[:, ge]    # [Tk]
         output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))

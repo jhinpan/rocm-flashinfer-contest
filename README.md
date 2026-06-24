@@ -16,17 +16,65 @@ so they build with the portable PythonBuilder — no `nvcc`, no CUDA dependencie
 ## TL;DR results (AMD MI300X)
 
 All five kernels pass the official `verify.py` scorer on ROCm. Speedup is measured against the
-**identical pure-torch reference** in each definition (`speedup = reference_ms / solution_ms`).
+**identical pure-torch reference** in each definition (`speedup = reference_ms / solution_ms`). Two
+RLCR loops have run: **v2** vs the locked `baseline/v1`, then **v3** which deepened the three
+highest-headroom kernels further, judged vs the immutable **`baseline-v2`** tag. The table shows the
+current (v3) state.
 
-| # | Kernel | Correctness (official `verify.py`) | AMD speedup vs torch reference |
-|---|--------|:--:|--|
-| 1 | `gdn_decode` | ✅ 54/54 | **12× – 578×** (grows with batch) |
-| 2 | `gdn_prefill` | ✅ 100/100 | **9× – 537×** (grows with seq len) |
-| 3 | `dsa_sparse_attention` | ✅ 23/23 | 1.0× – 3.7× |
-| 4 | `dsa_topk_indexer_fp8` | ✅ 128/128 | 2.4× – 20× |
-| 5 | `moe_fp8_block_scale` | ✅ 19/19 (loose tol) | 1.2× – 3.8× |
+| # | Kernel | Correctness (official `verify.py`) | speedup vs torch reference | vs `baseline/v1` (contest) | v3 gain vs `baseline-v2` |
+|---|--------|:--:|--|--|--|
+| 1 | `gdn_decode` | ✅ 54/54 | **48× – 3700×** (grows with batch) | **3.8× – 6.1×** | **+64 – 79%** (k-last, no transposes) |
+| 2 | `gdn_prefill` | ✅ 100/100 | **9× – ~3500×** (grows with seq len) | **+84.8%** (long seq) | ≈0% (untouched) |
+| 3 | `dsa_sparse_attention` | ✅ 23/23 | 3.4× – 12.3× | **+70%** | ≈0% (untouched) |
+| 4 | `dsa_topk_indexer_fp8` | ✅ 128/128 | 2.2× – 20× | ~1.0× (mr 1.0 default) | robustness fix¹ |
+| 5 | `moe_fp8_block_scale` | ✅ 19/19 (loose tol) | 1.5× – 4.5× | **1.14× – 1.51×** | **+3 to +24%** (fused dequant) |
 
-Full measured numbers: [`results/amd_mi300.md`](results/amd_mi300.md).
+¹ `dsa_topk_indexer` default is the exact `torch.bmm` path (per-run matched-ratio 1.0, restoring v2's
+0.988–0.992). A faster packed-page kernel (`DSA_TOPK_FAST=1`) is **+10–21%** vs baseline-v2 and passes
+the official 128/128, but lands at mr ~0.99, so it ships behind a flag rather than as the default.
+
+**📋 Full write-up — content, results, and RLCR findings:**
+[**`results/v3-summary.md`**](results/v3-summary.md). Raw numbers:
+[`results/amd_mi300.md`](results/amd_mi300.md) (v3 candidate vs baseline-v2 and baseline/v1) ·
+verdicts: [`results/v3_final-loop-report.md`](results/v3_final-loop-report.md) · full official
+correctness: [`results/v3_final_verify.md`](results/v3_final_verify.md) · v2 report:
+[`results/final-loop-report.md`](results/final-loop-report.md).
+
+### Optimization methodology (RLCR)
+
+The kernels were produced by autonomous **RLCR** (Reinforcement-Learning-from-Code-Review)
+optimization loops run with the [`rocm-KDA-pilot`](https://github.com/jhinpan/rocm-KDA-pilot) skill —
+a ROCm/MI300 kernel-optimization harness **inspired by [Humanize](https://github.com/PolyArch) and
+the Kernel Design Agent (KDA)**. Each candidate is gated on the official `verify.py` correctness
+counts (never weakened), benchmarked against an immutable baseline (v2 → `baseline/v1`; v3 →
+`baseline-v2`) with HIP-event timing and full provenance, and accepted only with reproducible
+evidence or closed with an evidence-backed NO-GO. v2 wins came from removing host-side waste (a
+per-call full-cache `torch.cat` in `dsa_sparse_attention`, `repeat_interleave` weight dequant in
+`moe_fp8`, host-side gate compute in `gdn_decode`) and a genuine algorithmic lever (chunk-parallel
+prefill in `gdn_prefill`). v3 went deeper: a custom **k-last** `gdn_decode` Triton kernel that reads
+and writes state in the contest layout directly (no host-side transposes, +64–79%), a fused **Triton
+block-scale dequant** for `moe_fp8` that feeds rocBLAS (+3–24%), and a robustness fix for
+`dsa_topk_indexer` (exact-`bmm` default restoring matched-ratio 1.0, with a faster packed-page kernel
+behind `DSA_TOPK_FAST=1`).
+
+**Reusable findings (full discussion in [`results/v3-summary.md`](results/v3-summary.md)):**
+- **Profile host overhead before tuning the kernel** — the biggest wins were deleting host-side waste
+  (a full-cache `torch.cat`, two state transposes, fp32 dequant temporaries), not micro-tuning.
+- **A portable hand-written GEMM does not beat rocBLAS/Tensile** — the winning shape is *fused dequant
+  feeding rocBLAS*, not *fused GEMM* (a fused-GEMM attempt was correct but slower; kept behind
+  `MOE_USE_FUSED=1` as evidence).
+- **For a layout-mismatched vendor kernel, re-implement the math in the target layout** rather than
+  transposing around it (removing both boundary copies beat shaving one → the `gdn_decode` win).
+- **Exact top-k gated on bit-level reference parity needs the same GEMM the reference uses** — `tl.dot`
+  can't bit-match `torch.bmm`, so "fast + matched-ratio≈1.0" can be mutually exclusive; the honest
+  result is an evidence-backed NO-GO plus a flagged speed option (`dsa_topk_indexer`).
+- **gfx942 native fp8 is `e4m3fnuz`, not the contest's `e4m3fn`** (≈2× decode error) — keep software
+  dequant; never bit-reinterpret to force a vendor fp8 path.
+- **An evidence-backed NO-GO is a first-class result** — it blocks reward-hacking (no per-workload
+  fitting, no warmup/input-keyed caches) and yields an honest, generalizing verdict.
+
+The loop converged in **7 rounds (budget 12)**, exited *complete*, and its code-review reviewer
+caught only substantive issues (≈zero false positives); see the methodology view in the summary.
 
 ## NVIDIA vs AMD
 

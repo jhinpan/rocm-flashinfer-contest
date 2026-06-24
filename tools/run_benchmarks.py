@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import math
 import os
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -32,6 +33,105 @@ from flashinfer_bench.compile import BuilderRegistry
 from flashinfer_bench.data import TraceSet
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _pkg_version(name):
+    """Prefer installed package metadata (no import side effects); fall back to module __version__."""
+    try:
+        from importlib.metadata import version
+        return version(name)
+    except Exception:
+        try:
+            return __import__(name).__version__
+        except Exception:
+            return "n/a"
+
+
+def _git(*args):
+    try:
+        return subprocess.check_output(["git", "-C", str(ROOT), *args],
+                                       stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return "n/a"
+
+
+# git ref for the immutable comparison base, peeled to its commit (annotated tag -> commit).
+BASELINE_REF = "baseline-v1^{}"
+
+
+def _aiter_provenance():
+    """Resolve aiter version+source WITHOUT importing aiter (import has JIT side effects)."""
+    import importlib.util
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        ver = version("aiter")
+    except PackageNotFoundError:
+        ver = "editable-source"
+    except Exception:
+        ver = "unknown"
+    src = "n/a"
+    commit = "n/a"
+    try:
+        spec = importlib.util.find_spec("aiter")
+        if spec and spec.origin:
+            src = str(Path(spec.origin).resolve().parent)
+            commit = subprocess.check_output(["git", "-C", src, "rev-parse", "--short", "HEAD"],
+                                             stderr=subprocess.DEVNULL).decode().strip() or "n/a"
+    except Exception:
+        pass
+    return f"{ver} ({src}@{commit})"
+
+
+def collect_provenance(device):
+    """Reproducibility metadata stamped into every results file so a candidate-vs-baseline
+    comparison is apples-to-apples (exact command, commit, baseline ref, GPU, library versions)."""
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+        "command": "python " + " ".join(sys.argv),
+        "commit": _git("rev-parse", "HEAD"),
+        "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+        "describe": _git("describe", "--tags", "--always", "--dirty"),
+        # primary comparison base (peeled commit of the selected --baseline-ref) + the contest v1 base
+        "primary_baseline_ref": BASELINE_REF,
+        "primary_baseline_commit": _git("rev-parse", "--short", BASELINE_REF),
+        "baseline_v1_commit": _git("rev-parse", "--short", "baseline-v1^{}"),
+        "dirty": "yes" if _git("status", "--porcelain") else "no",
+        "gpu": torch.cuda.get_device_name(0),
+        "device": device,
+        "torch": torch.__version__,
+        "hip": getattr(torch.version, "hip", None) or "n/a",
+        "triton": _pkg_version("triton"),
+        "aiter": _aiter_provenance(),
+        "dataset": os.environ.get("FIB_DATASET_PATH", "n/a"),
+        "fib_cache": os.environ.get("FIB_CACHE_PATH", "n/a"),
+        "sol_env": _sol_env(),
+    }
+
+
+# Env vars that switch a solution's internal path — must be recorded so a result is reproducible.
+_SOL_ENV_VARS = ("MOE_USE_FUSED", "MOE_DEQUANT_TORCH", "DSA_USE_AITER", "DSA_TOPK_FAST",
+                 "GDN_DECODE_FUSEDOP", "GDN_DECODE_RECURRENT", "GDN_DECODE_CONTIG_STATE",
+                 "GDN_PREFILL_RECURRENT", "GDN_PREFILL_CHUNK_MIN")
+
+
+def _sol_env():
+    on = {k: os.environ[k] for k in _SOL_ENV_VARS if os.environ.get(k)}
+    return ", ".join(f"{k}={v}" for k, v in on.items()) if on else "(defaults)"
+
+
+_PROV_FIELDS = ("timestamp_utc", "command", "commit", "branch", "describe", "primary_baseline_ref",
+                "primary_baseline_commit", "baseline_v1_commit", "dirty", "gpu", "device", "torch",
+                "hip", "triton", "aiter", "dataset", "fib_cache", "sol_env")
+
+
+def provenance_md(p):
+    lines = ["## Provenance", "",
+             "Reproducibility metadata for this run (candidate-vs-`baseline/v1` comparisons are",
+             "only valid when these match).", "",
+             "| field | value |", "|---|---|"]
+    for k in _PROV_FIELDS:
+        lines.append(f"| {k} | `{p[k]}` |")
+    return "\n".join(lines) + "\n\n"
 
 # (definition, solution_dir, n_buckets, tol(atol,rtol,mr), n_outputs_to_compare or 'topk', iters)
 KERNELS = [
@@ -48,15 +148,55 @@ KERNELS = [
 ]
 
 
-def load_run(path):
-    spec = importlib.util.spec_from_file_location("m", path)
+def load_run(path, modname="m"):
+    spec = importlib.util.spec_from_file_location(modname, path)
     m = importlib.util.module_from_spec(spec)
+    sys.modules[modname] = m
     spec.loader.exec_module(m)
     return m.run
 
 
+def load_run_from_ref(sdir, ref, tmpdir, tag):
+    """Load solutions/<sdir>/main.py as it exists at a git ref (e.g. the peeled baseline commit),
+    so a comparison times that exact committed code, not the working tree. Returns None if the file
+    cannot be read at that ref."""
+    try:
+        src = subprocess.check_output(
+            ["git", "-C", str(ROOT), "show", f"{ref}:solutions/{sdir}/main.py"],
+            stderr=subprocess.DEVNULL).decode()
+    except Exception:
+        return None
+    p = Path(tmpdir) / f"{tag}_{sdir}.py"
+    p.write_text(src)
+    return load_run(p, modname=f"{tag}_{sdir}")
+
+
+def load_baseline_run(sdir, tmpdir):
+    return load_run_from_ref(sdir, BASELINE_REF, tmpdir, "baseline")
+
+
 def as_list(r):
     return list(r) if isinstance(r, (tuple, list)) else [r]
+
+
+def clone_args(inp):
+    """Fresh copy of the argument list so candidate and baseline each time on pristine inputs
+    (cloned OUTSIDE the timed region — never inside time_runnable's loop)."""
+    return [x.clone() if torch.is_tensor(x) else x for x in inp]
+
+
+def mutates_inputs(fn, inp, dev):
+    """Read-only check: run fn once on a clone and report whether any input tensor changed.
+    A candidate that mutates inputs would invalidate paired timing / the reference comparison."""
+    snap = [x.clone() if torch.is_tensor(x) else None for x in inp]
+    args = clone_args(inp)
+    with torch.no_grad():
+        fn(*args)
+    torch.cuda.synchronize(dev)
+    for a, s in zip(args, snap):
+        if s is not None and (a.shape != s.shape or not torch.equal(a, s)):
+            return True
+    return False
 
 
 # Use the official evaluator's scoring helpers so correctness exactly matches verify.py.
@@ -103,7 +243,28 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--baseline", action="store_true", help="also benchmark NV flashinfer_wrapper baselines")
+    ap.add_argument("--no-baseline-compare", action="store_true",
+                    help="skip timing the baseline-v1 solution (candidate-vs-baseline columns blank)")
+    ap.add_argument("--repeat-runs", type=int, default=3,
+                    help="repeat each candidate/baseline timing N times (paired, alternating order) "
+                         "and report the median of medians plus min/max spread. Reduces small-kernel "
+                         "timing noise so candidate-vs-baseline claims are trustworthy.")
+    ap.add_argument("--baseline-ref", default=None,
+                    help="git ref of the locked comparison base to load baseline solutions from "
+                         "(default 'baseline-v1^{}'). Use 'baseline-v2^{}' to compare candidates "
+                         "against the shipped v2 state (the v3 no-regression base).")
+    ap.add_argument("--candidate-ref", default=None,
+                    help="load the candidate solution from this git ref instead of the working tree "
+                         "(e.g. --candidate-ref 'baseline-v1^{}' makes candidate==baseline for an "
+                         "unchanged-code self-check; ratios must come out ~1.00x).")
+    ap.add_argument("--only", default=None,
+                    help="comma-separated solution dir names to benchmark (e.g. --only dsa_topk_indexer); "
+                         "default runs all kernels.")
     args = ap.parse_args()
+
+    if args.baseline_ref:
+        global BASELINE_REF
+        BASELINE_REF = args.baseline_ref       # compare candidates against this locked base
 
     ds = os.environ.get("FIB_DATASET_PATH")
     assert ds, "set FIB_DATASET_PATH"
@@ -111,16 +272,37 @@ def main():
     ts = TraceSet.from_path(root)
     dev = args.device
     plat = torch.cuda.get_device_name(0)
+    prov = collect_provenance(dev)
+    print("provenance:", {k: prov[k] for k in
+                          ("commit", "branch", "primary_baseline_ref", "primary_baseline_commit",
+                           "baseline_v1_commit", "gpu", "dirty")})
 
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix="fib_baseline_")
     rows = []
+    only = set(args.only.split(",")) if args.only else None
     for defn, sdir, axis, (atol, rtol, mr), ncmp, iters in KERNELS:
+        if only is not None and sdir not in only:
+            continue
         if defn not in ts.definitions:
             print(f"skip {defn} (not in dataset)"); continue
         definition = ts.definitions[defn]
         cfg = ResolvedEvalConfig(warmup_runs=5, iterations=iters, num_trials=1,
                                  rtol=rtol, atol=atol, required_matched_ratio=mr)
         ref_runnable = BuilderRegistry.get_instance().build_reference(definition)
-        run = load_run(ROOT / "solutions" / sdir / "main.py")
+        if args.candidate_ref:
+            run = load_run_from_ref(sdir, args.candidate_ref, tmpdir, "candidate")
+            if run is None:
+                print(f"  (warn: no candidate at {args.candidate_ref} for {sdir}; skipping)"); continue
+        else:
+            run = load_run(ROOT / "solutions" / sdir / "main.py")
+        base_run = None if args.no_baseline_compare else load_baseline_run(sdir, tmpdir)
+        if base_run is None and not args.no_baseline_compare:
+            print(f"  (warn: no {BASELINE_REF} solution for {sdir}; primary-baseline columns blank)")
+        # Also time baseline/v1 (the contest denominator) when the primary base is not already v1.
+        base_v1_run = None
+        if not args.no_baseline_compare and BASELINE_REF != "baseline-v1^{}":
+            base_v1_run = load_run_from_ref(sdir, "baseline-v1^{}", tmpdir, "basev1")
         wls = [w.workload for w in ts.workloads[defn]]
         for w in pick_buckets(wls, axis, 3):
             safe = (load_safetensors(definition, w, root)
@@ -142,30 +324,105 @@ def main():
                     _, _, ex, m = compute_error_stats(s, ref_out[i], cfg)
                     mr_v = min(mr_v, m); ok = ok and (not ex)
 
-            ref_ms = time_runnable(ref_runnable, inp, 5, iters, dev)
-            sol_ms = time_runnable(run, inp, 5, iters, dev)
-            rows.append(dict(kernel=defn, axes=dict(w.axes), ref_ms=ref_ms, sol_ms=sol_ms,
+            import statistics as _stats
+            # Read-only check: a candidate that mutates inputs would corrupt paired timing.
+            if mutates_inputs(run, inp, dev):
+                print(f"  WARNING: {sdir} candidate mutates its inputs — paired timing/ref compare "
+                      f"may be invalid; results suspect.")
+            # Repeated PAIRED timing, each call on a FRESH clone of the inputs (clone is outside the
+            # timed region). Alternate candidate/baseline order per repeat to cancel ordering drift.
+            R = max(1, args.repeat_runs)
+            sol_runs, base_runs = [], []
+            ref_ms = time_runnable(ref_runnable, clone_args(inp), 5, iters, dev)
+            for rr in range(R):
+                if rr % 2 == 0:
+                    sol_runs.append(time_runnable(run, clone_args(inp), 5, iters, dev))
+                    if base_run is not None:
+                        base_runs.append(time_runnable(base_run, clone_args(inp), 5, iters, dev))
+                else:
+                    if base_run is not None:
+                        base_runs.append(time_runnable(base_run, clone_args(inp), 5, iters, dev))
+                    sol_runs.append(time_runnable(run, clone_args(inp), 5, iters, dev))
+            sol_ms = _stats.median(sol_runs)
+            base_ms = _stats.median(base_runs) if base_runs else None
+            cvb = (base_ms / sol_ms) if base_ms else None            # candidate-vs-primary-base (>1 = faster)
+            red = (100.0 * (1 - sol_ms / base_ms)) if base_ms else None  # latency reduction %
+            # baseline/v1 timing (contest denominator) with the same repeat/spread discipline.
+            if base_v1_run is not None:
+                v1_runs = [time_runnable(base_v1_run, clone_args(inp), 5, iters, dev) for _ in range(R)]
+                base_v1_ms = _stats.median(v1_runs); base_v1_min = min(v1_runs); base_v1_max = max(v1_runs)
+            elif BASELINE_REF == "baseline-v1^{}" and base_runs:
+                # primary base IS v1 — alias the primary timings into the v1 fields (no blank).
+                base_v1_ms, base_v1_min, base_v1_max = base_ms, min(base_runs), max(base_runs)
+            else:
+                base_v1_ms = base_v1_min = base_v1_max = None
+            cvb_v1 = (base_v1_ms / sol_ms) if base_v1_ms else None
+            red_v1 = (100.0 * (1 - sol_ms / base_v1_ms)) if base_v1_ms else None
+            rows.append(dict(kernel=defn, sdir=sdir, axes=dict(w.axes), ref_ms=ref_ms, sol_ms=sol_ms,
+                             sol_min=min(sol_runs), sol_max=max(sol_runs),
+                             base_ms=base_ms,
+                             base_min=(min(base_runs) if base_runs else None),
+                             base_max=(max(base_runs) if base_runs else None),
+                             cvb=cvb, red=red, base_v1_ms=base_v1_ms, base_v1_min=base_v1_min,
+                             base_v1_max=base_v1_max, cvb_v1=cvb_v1, red_v1=red_v1,
                              speedup=ref_ms / sol_ms, ok=ok, mr=mr_v))
-            print(f"{sdir:22s} {str(dict(w.axes)):42s} ref={ref_ms:9.3f} sol={sol_ms:8.3f} "
-                  f"speedup={ref_ms/sol_ms:7.2f}x {'PASS' if ok else 'FAIL'}(mr={mr_v:.3f})")
+            v1x = (f" v1={base_v1_ms:8.3f} cvb_v1={cvb_v1:5.2f}x" if base_v1_ms else "")
+            extra = (f" base={base_ms:8.3f} cvb={cvb:5.2f}x red={red:+5.1f}%{v1x}"
+                     if base_ms else " base=  n/a")
+            print(f"{sdir:22s} {str(dict(w.axes)):42s} ref={ref_ms:9.3f} sol={sol_ms:8.3f}"
+                  f"[{min(sol_runs):.3f},{max(sol_runs):.3f}]{extra} "
+                  f"{'PASS' if ok else 'FAIL'}(mr={mr_v:.3f})")
 
     out = Path(ROOT / args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    def fmt(x, p=4):
+        return f"{x:.{p}f}" if x is not None else ""
+
+    # Primary base: pretty markdown label ("baseline-v2") and a stable CSV identifier ("baseline_v2").
+    pbase = BASELINE_REF.replace("^{}", "")
+    pbase_csv = pbase.replace("-", "_").replace("/", "_")
     csv = out.with_suffix(".csv")
     with open(csv, "w") as f:
-        f.write("kernel,axes,ref_ms,sol_ms,speedup,correctness,matched_ratio\n")
+        # full provenance as leading comment lines (one field per line for grep-ability)
+        for k in _PROV_FIELDS:
+            f.write(f"# {k}={prov[k]}\n")
+        f.write(f"kernel,axes,ref_ms,sol_ms,sol_ms_min,sol_ms_max,"
+                f"{pbase_csv}_ms,{pbase_csv}_ms_min,{pbase_csv}_ms_max,candidate_vs_{pbase_csv},"
+                f"latency_reduction_vs_{pbase_csv}_pct,"
+                f"baseline_v1_ms,baseline_v1_ms_min,baseline_v1_ms_max,candidate_vs_baseline_v1,"
+                f"latency_reduction_vs_baseline_v1_pct,"
+                f"speedup_vs_ref,correctness,matched_ratio\n")
         for r in rows:
             f.write(f"{r['kernel']},\"{r['axes']}\",{r['ref_ms']:.4f},{r['sol_ms']:.4f},"
+                    f"{fmt(r['sol_min'])},{fmt(r['sol_max'])},{fmt(r['base_ms'])},"
+                    f"{fmt(r['base_min'])},{fmt(r['base_max'])},{fmt(r['cvb'],3)},{fmt(r['red'],2)},"
+                    f"{fmt(r['base_v1_ms'])},{fmt(r['base_v1_min'])},{fmt(r['base_v1_max'])},"
+                    f"{fmt(r['cvb_v1'],3)},{fmt(r['red_v1'],2)},"
                     f"{r['speedup']:.3f},{'PASS' if r['ok'] else 'FAIL'},{r['mr']:.4f}\n")
     md = out.with_suffix(".md")
     with open(md, "w") as f:
         f.write(f"# Benchmark results — {plat}\n\n")
-        f.write("Speedup = torch-reference latency / solution latency (same reference on every platform).\n\n")
-        f.write("| Kernel | Workload | reference ms | solution ms | speedup | correctness |\n")
-        f.write("|---|---|---:|---:|---:|:--:|\n")
+        f.write(f"`speedup_vs_ref` = torch-reference latency / solution latency.\n"
+                f"`cand/{pbase}` = {pbase} solution latency / candidate latency (>1 = candidate "
+                f"faster); `Δ vs {pbase}` = latency reduction vs {pbase}.\n"
+                f"`cand/v1` / `Δ vs v1` = same against the contest base `baseline/v1`.\n\n")
+        f.write(provenance_md(prov))
+        f.write(f"| Kernel | Workload | reference ms | solution ms (min–max) | {pbase} ms | "
+                f"cand/{pbase} | Δ vs {pbase} | baseline-v1 ms | cand/v1 | Δ vs v1 | "
+                f"speedup_vs_ref | correctness |\n")
+        f.write("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--:|\n")
         for r in rows:
-            f.write(f"| `{r['kernel'].split('_')[0]}…` | {r['axes']} | {r['ref_ms']:.3f} | "
-                    f"{r['sol_ms']:.3f} | **{r['speedup']:.2f}×** | {'✅' if r['ok'] else '❌'} |\n")
+            cvb = f"{r['cvb']:.2f}×" if r['cvb'] is not None else "—"
+            red = f"{r['red']:+.1f}%" if r['red'] is not None else "—"
+            base = (f"{r['base_ms']:.3f} ({r['base_min']:.3f}–{r['base_max']:.3f})"
+                    if r['base_ms'] is not None else "—")
+            bv1 = f"{r['base_v1_ms']:.3f}" if r['base_v1_ms'] is not None else "—"
+            cvb1 = f"{r['cvb_v1']:.2f}×" if r['cvb_v1'] is not None else "—"
+            red1 = f"{r['red_v1']:+.1f}%" if r['red_v1'] is not None else "—"
+            sol = f"{r['sol_ms']:.3f} ({r['sol_min']:.3f}–{r['sol_max']:.3f})"
+            f.write(f"| `{r['sdir']}` | {r['axes']} | {r['ref_ms']:.3f} | "
+                    f"{sol} | {base} | {cvb} | {red} | {bv1} | {cvb1} | {red1} | "
+                    f"**{r['speedup']:.2f}×** | {'✅' if r['ok'] else '❌'} |\n")
     print(f"\nwrote {md} and {csv}")
 
 
